@@ -385,9 +385,6 @@ class BaseLLM:
         if self._executor is None or self._executor.is_shutdown():
             raise RuntimeError("LLM is shutting down")
 
-        arrival_time = steady_clock_now(
-        ) if self.args.return_perf_metrics else None
-
         sampling_params = self._prepare_sampling_params(sampling_params)
         cache_salt_id = get_cache_salt_id(
             cache_salt) if cache_salt is not None else None
@@ -517,6 +514,10 @@ class BaseLLM:
             raise TypeError(
                 f"The inputs must be type str or list of int, but got {type(inputs)}"
             )
+
+        # arrival_time recorded after tokenization for ctx_preprocessing metric
+        arrival_time = steady_clock_now(
+        ) if self.args.return_perf_metrics else None
 
         self._check_arguments(
             len(prompt_token_ids),
