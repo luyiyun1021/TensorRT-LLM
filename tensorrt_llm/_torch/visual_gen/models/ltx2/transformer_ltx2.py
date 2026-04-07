@@ -48,7 +48,7 @@ from .ltx2_core.transformer_args import (
     TransformerArgsPreprocessor,
 )
 from .ltx2_core.utils_ltx2 import rms_norm
-from .text_context_cache import ModalityType
+from .text_context_cache import CfgPass, ModalityType
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
@@ -1194,7 +1194,7 @@ class LTXModel(nn.Module):
         audio: Modality | None,
         perturbations=None,
         text_cache: "LTX2TextContextCache" = None,
-        is_unconditional: bool = False,
+        cfg_pass: "CfgPass" = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Forward pass through the LTX-2 transformer.
 
@@ -1204,8 +1204,8 @@ class LTXModel(nn.Module):
             perturbations: Optional ``BatchedPerturbationConfig`` for STG.
             text_cache: Text context cache.  KV projections are filled before
                 the compiled block loop and passed to each block.
-            is_unconditional: ``True`` for the unconditional (negative prompt)
-                CFG pass.  Selects the appropriate cache slot.
+            cfg_pass: ``CfgPass.COND`` or ``CfgPass.UNCOND``.  Selects
+                the cache slot for CFG.
 
         Returns:
             Tuple of (video_output, audio_output) velocity predictions.
@@ -1216,14 +1216,10 @@ class LTXModel(nn.Module):
             raise ValueError("Audio is not enabled for this model")
 
         video_args = (
-            self.video_args_preprocessor.prepare(video, is_unconditional)
-            if video is not None
-            else None
+            self.video_args_preprocessor.prepare(video, cfg_pass) if video is not None else None
         )
         audio_args = (
-            self.audio_args_preprocessor.prepare(audio, is_unconditional)
-            if audio is not None
-            else None
+            self.audio_args_preprocessor.prepare(audio, cfg_pass) if audio is not None else None
         )
 
         # Shard sequences for Ulysses parallelism.
@@ -1235,17 +1231,17 @@ class LTXModel(nn.Module):
 
         # Fill text KV cache outside torch.compile.
         use_cache = text_cache is not None
-        if use_cache and text_cache.kv_is_dirty(is_unconditional):
+        if use_cache and text_cache.kv_is_dirty(cfg_pass):
             v_ctx = video_args.context if video_args is not None else None
             a_ctx = audio_args.context if audio_args is not None else None
             for i, block in enumerate(self.transformer_blocks):
                 if v_ctx is not None:
                     k, v = block.attn2.project_kv(v_ctx)
-                    text_cache.store_kv(ModalityType.VIDEO, is_unconditional, i, k, v)
+                    text_cache.store_kv(ModalityType.VIDEO, cfg_pass, i, k, v)
                 if a_ctx is not None:
                     k, v = block.audio_attn2.project_kv(a_ctx)
-                    text_cache.store_kv(ModalityType.AUDIO, is_unconditional, i, k, v)
-            text_cache.kv_mark_clean(is_unconditional)
+                    text_cache.store_kv(ModalityType.AUDIO, cfg_pass, i, k, v)
+            text_cache.kv_mark_clean(cfg_pass)
 
         for i, block in enumerate(self.transformer_blocks):
             video_args, audio_args = block(
@@ -1253,12 +1249,12 @@ class LTXModel(nn.Module):
                 audio=audio_args,
                 perturbations=perturbations,
                 text_kv_video=(
-                    text_cache.get_kv(ModalityType.VIDEO, is_unconditional, i)
+                    text_cache.get_kv(ModalityType.VIDEO, cfg_pass, i)
                     if use_cache and video_args is not None
                     else None
                 ),
                 text_kv_audio=(
-                    text_cache.get_kv(ModalityType.AUDIO, is_unconditional, i)
+                    text_cache.get_kv(ModalityType.AUDIO, cfg_pass, i)
                     if use_cache and audio_args is not None
                     else None
                 ),

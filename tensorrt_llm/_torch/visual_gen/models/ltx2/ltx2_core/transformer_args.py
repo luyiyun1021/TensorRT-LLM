@@ -9,6 +9,7 @@ from dataclasses import dataclass, replace
 
 import torch
 
+from ..text_context_cache import CfgPass
 from .adaln import AdaLayerNormSingle
 from .modality import Modality
 from .rope import (
@@ -134,7 +135,7 @@ class TransformerArgsPreprocessor:
             freq_grid_cache=self._freq_grid_cache,
         )
 
-    def prepare(self, modality: Modality, is_unconditional: bool = False) -> TransformerArgs:
+    def prepare(self, modality: Modality, cfg_pass: "CfgPass" = CfgPass.COND) -> TransformerArgs:
         x = self.patchify_proj(modality.latent.contiguous())
         timestep, embedded_timestep = self._prepare_timestep(
             modality.timesteps, x.shape[0], modality.latent.dtype
@@ -143,7 +144,7 @@ class TransformerArgsPreprocessor:
         # Context projection, attention mask, and RoPE are constant across
         # denoise steps.  Try cache first; compute on miss or when disabled.
         entry = (
-            self._text_cache.get_preproc(is_unconditional, self._modality)
+            self._text_cache.get_preproc(cfg_pass, self._modality)
             if self._text_cache is not None
             else None
         )
@@ -224,14 +225,14 @@ class MultiModalTransformerArgsPreprocessor:
         """Inject shared text context cache.  Delegates to inner preprocessor."""
         self.simple_preprocessor.set_text_cache(cache, modality)
 
-    def prepare(self, modality: Modality, is_unconditional: bool = False) -> TransformerArgs:
+    def prepare(self, modality: Modality, cfg_pass: "CfgPass" = CfgPass.COND) -> TransformerArgs:
         sp = self.simple_preprocessor
-        transformer_args = sp.prepare(modality, is_unconditional)
+        transformer_args = sp.prepare(modality, cfg_pass)
 
         # Cross-PE: constant across steps, cache when enabled.
         # Reuse the same entry that prepare() just read/wrote.
         entry = (
-            sp._text_cache.get_preproc(is_unconditional, sp._modality)
+            sp._text_cache.get_preproc(cfg_pass, sp._modality)
             if sp._text_cache is not None
             else None
         )

@@ -43,6 +43,7 @@ from .ltx2_core.types import (
     VideoPixelShape,
 )
 from .ltx2_core.video_vae import TilingConfig, VideoDecoderConfigurator, VideoEncoderConfigurator
+from .text_context_cache import CfgPass, LTX2TextContextCache, ModalityType
 from .transformer_ltx2 import LTXModel, LTXModelType
 
 
@@ -567,15 +568,10 @@ class LTX2Pipeline(BasePipeline):
 
         # Text context cache — caches constant text computations across
         # denoise steps.  Supports 2 CFG slots (cond + uncond).
-        from .text_context_cache import LTX2TextContextCache
-
         self._text_cache = LTX2TextContextCache(
             num_layers=getattr(cfg, "num_layers", 48),
-            max_batch_size=1,
         )
         # Inject cache into preprocessors for context/mask/PE caching.
-        from .text_context_cache import ModalityType
-
         self.transformer.video_args_preprocessor.set_text_cache(
             self._text_cache, ModalityType.VIDEO
         )
@@ -1449,7 +1445,7 @@ class LTX2Pipeline(BasePipeline):
             a_context,
             mask,
             perturbations=None,
-            is_unconditional=False,
+            cfg_pass=CfgPass.COND,
         ):
             """Single transformer pass → (denoised_video, denoised_audio).
 
@@ -1500,7 +1496,7 @@ class LTX2Pipeline(BasePipeline):
                 audio=audio_mod,
                 perturbations=perturbations,
                 text_cache=self._text_cache,
-                is_unconditional=is_unconditional,
+                cfg_pass=cfg_pass,
             )
 
             dn_v = None
@@ -1568,7 +1564,7 @@ class LTX2Pipeline(BasePipeline):
                         neg_video_embeds,
                         neg_audio_embeds,
                         neg_connector_mask,
-                        is_unconditional=True,
+                        cfg_pass=CfgPass.UNCOND,
                     )
 
                 local_v = local_v.contiguous()
@@ -1605,7 +1601,7 @@ class LTX2Pipeline(BasePipeline):
                         neg_video_embeds,
                         neg_audio_embeds,
                         neg_connector_mask,
-                        is_unconditional=True,
+                        cfg_pass=CfgPass.UNCOND,
                     )
 
             # STG: perturbed attention pass

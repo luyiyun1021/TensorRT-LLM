@@ -30,7 +30,7 @@ from enum import IntEnum
 import torch
 
 
-class CfgSlot(IntEnum):
+class CfgPass(IntEnum):
     """CFG pass type — used as cache slot index."""
 
     COND = 0
@@ -59,72 +59,66 @@ class LTX2TextContextCache:
 
     Args:
         num_layers: Number of transformer blocks.
-        max_batch_size: Maximum batch size for pre-allocated KV buffers.
     """
 
-    def __init__(self, num_layers: int, max_batch_size: int = 1) -> None:
+    def __init__(self, num_layers: int) -> None:
         self.num_layers = num_layers
-        self.max_batch_size = max_batch_size
 
-        num_slots = len(CfgSlot)
+        num_slots = len(CfgPass)
         num_modalities = len(ModalityType)
 
-        # Preprocessor cache: [slot][modality] → _PreprocEntry
+        # Preprocessor cache: [cfg_pass][modality] → _PreprocEntry
         self._preproc: list[list[_PreprocEntry]] = [
             [_PreprocEntry() for _ in range(num_modalities)] for _ in range(num_slots)
         ]
 
-        # Per-block KV cache: [slot][modality][layer] → (k, v) | None
-        # Buffers are allocated on first fill and retained across invalidate().
+        # Per-block KV cache: [cfg_pass][modality][layer] → (k, v) | None
         self._kv: list[list[list[tuple[torch.Tensor, torch.Tensor] | None]]] = [
             [[None] * num_layers for _ in range(num_modalities)] for _ in range(num_slots)
         ]
-        # Dirty flag per slot — True means needs refill.
         self._kv_dirty: list[bool] = [True] * num_slots
 
     def invalidate(self) -> None:
         """Mark all slots dirty.  Buffers are retained for ``copy_()`` reuse."""
-        for s in CfgSlot:
+        for s in CfgPass:
             for m in ModalityType:
                 self._preproc[s][m] = _PreprocEntry()
             self._kv_dirty[s] = True
 
     # -- Preprocessor cache ------------------------------------------------
 
-    def get_preproc(self, is_unconditional: bool, modality: ModalityType) -> _PreprocEntry:
+    def get_preproc(self, cfg_pass: CfgPass, modality: ModalityType) -> _PreprocEntry:
         """Return the preprocessor cache entry for reading/writing."""
-        return self._preproc[CfgSlot.UNCOND if is_unconditional else CfgSlot.COND][modality]
+        return self._preproc[cfg_pass][modality]
 
     # -- KV cache ----------------------------------------------------------
 
-    def kv_is_dirty(self, is_unconditional: bool) -> bool:
+    def kv_is_dirty(self, cfg_pass: CfgPass) -> bool:
         """Return True if this slot needs KV refill."""
-        return self._kv_dirty[CfgSlot.UNCOND if is_unconditional else CfgSlot.COND]
+        return self._kv_dirty[cfg_pass]
 
-    def kv_mark_clean(self, is_unconditional: bool) -> None:
+    def kv_mark_clean(self, cfg_pass: CfgPass) -> None:
         """Mark this slot as filled.  Call after storing all layers."""
-        self._kv_dirty[CfgSlot.UNCOND if is_unconditional else CfgSlot.COND] = False
+        self._kv_dirty[cfg_pass] = False
 
     def store_kv(
         self,
         modality: ModalityType,
-        is_unconditional: bool,
+        cfg_pass: CfgPass,
         layer_idx: int,
         k: torch.Tensor,
         v: torch.Tensor,
     ) -> None:
         """Store KV for one layer.  Reuses buffer on subsequent calls."""
-        s = CfgSlot.UNCOND if is_unconditional else CfgSlot.COND
-        existing = self._kv[s][modality][layer_idx]
+        existing = self._kv[cfg_pass][modality][layer_idx]
         if existing is not None:
             existing[0].copy_(k)
             existing[1].copy_(v)
         else:
-            self._kv[s][modality][layer_idx] = (k.clone(), v.clone())
+            self._kv[cfg_pass][modality][layer_idx] = (k.clone(), v.clone())
 
     def get_kv(
-        self, modality: ModalityType, is_unconditional: bool, layer_idx: int
+        self, modality: ModalityType, cfg_pass: CfgPass, layer_idx: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return cached KV for a compiled block."""
-        s = CfgSlot.UNCOND if is_unconditional else CfgSlot.COND
-        return self._kv[s][modality][layer_idx]
+        return self._kv[cfg_pass][modality][layer_idx]

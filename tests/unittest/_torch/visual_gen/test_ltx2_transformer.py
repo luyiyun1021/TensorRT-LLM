@@ -534,6 +534,7 @@ class TestLTX2TextContextCache(unittest.TestCase):
         """
         from tensorrt_llm._torch.visual_gen.models.ltx2.ltx2_core.modality import Modality
         from tensorrt_llm._torch.visual_gen.models.ltx2.text_context_cache import (
+            CfgPass,
             LTX2TextContextCache,
         )
         from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import (
@@ -595,17 +596,17 @@ class TestLTX2TextContextCache(unittest.TestCase):
         with torch.no_grad():
             # -- Part 1: cache hit == no cache (bitwise) --
             torch.manual_seed(100)
-            model(*make_mods(0.8, v_ctx_A, a_ctx_A), text_cache=cache, is_unconditional=False)
+            model(*make_mods(0.8, v_ctx_A, a_ctx_A), text_cache=cache, cfg_pass=CfgPass.COND)
             torch.manual_seed(200)
             v_cached, a_cached = model(
-                *make_mods(0.5, v_ctx_A, a_ctx_A), text_cache=cache, is_unconditional=False
+                *make_mods(0.5, v_ctx_A, a_ctx_A), text_cache=cache, cfg_pass=CfgPass.COND
             )
 
             # Invalidate and re-run — cache refills from scratch
             cache.invalidate()
             torch.manual_seed(200)
             v_nocache, a_nocache = model(
-                *make_mods(0.5, v_ctx_A, a_ctx_A), text_cache=cache, is_unconditional=False
+                *make_mods(0.5, v_ctx_A, a_ctx_A), text_cache=cache, cfg_pass=CfgPass.COND
             )
 
         self.assertTrue(
@@ -622,7 +623,7 @@ class TestLTX2TextContextCache(unittest.TestCase):
             cache.invalidate()
             torch.manual_seed(200)
             v_B, a_B = model(
-                *make_mods(0.5, v_ctx_B, a_ctx_B), text_cache=cache, is_unconditional=False
+                *make_mods(0.5, v_ctx_B, a_ctx_B), text_cache=cache, cfg_pass=CfgPass.COND
             )
 
         self.assertFalse(torch.equal(v_nocache, v_B), "Video: cache may be stale")
@@ -633,11 +634,11 @@ class TestLTX2TextContextCache(unittest.TestCase):
             cache.invalidate()
             torch.manual_seed(200)
             v_cond, _ = model(
-                *make_mods(0.5, v_ctx_A, a_ctx_A), text_cache=cache, is_unconditional=False
+                *make_mods(0.5, v_ctx_A, a_ctx_A), text_cache=cache, cfg_pass=CfgPass.COND
             )
             torch.manual_seed(200)
             v_uncond, _ = model(
-                *make_mods(0.5, v_ctx_B, a_ctx_B), text_cache=cache, is_unconditional=True
+                *make_mods(0.5, v_ctx_B, a_ctx_B), text_cache=cache, cfg_pass=CfgPass.UNCOND
             )
 
         self.assertFalse(torch.equal(v_cond, v_uncond), "CFG slots must differ")
