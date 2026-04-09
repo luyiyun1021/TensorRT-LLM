@@ -142,13 +142,9 @@ class TransformerArgsPreprocessor:
         )
 
         # Context projection, attention mask, and RoPE are constant across
-        # denoise steps.  Try cache first; compute on miss or when disabled.
-        entry = (
-            self._text_cache.get_preproc(cfg_pass, self._modality)
-            if self._text_cache is not None
-            else None
-        )
-        if entry is not None and entry.context is not None:
+        # denoise steps — cached per CFG slot and reused.
+        entry = self._text_cache.get_preproc(cfg_pass, self._modality)
+        if entry.context is not None:
             context, attention_mask, pe = entry.context, entry.mask, entry.pe
         else:
             context, attention_mask = self._prepare_context(
@@ -163,8 +159,7 @@ class TransformerArgsPreprocessor:
                 num_attention_heads=self.num_attention_heads,
                 x_dtype=modality.latent.dtype,
             )
-            if entry is not None:
-                entry.context, entry.mask, entry.pe = context, attention_mask, pe
+            entry.context, entry.mask, entry.pe = context, attention_mask, pe
 
         return TransformerArgs(
             x=x,
@@ -229,17 +224,10 @@ class MultiModalTransformerArgsPreprocessor:
         sp = self.simple_preprocessor
         transformer_args = sp.prepare(modality, cfg_pass)
 
-        # Cross-PE: constant across steps, cache when enabled.
-        # Reuse the same entry that prepare() just read/wrote.
-        entry = (
-            sp._text_cache.get_preproc(cfg_pass, sp._modality)
-            if sp._text_cache is not None
-            else None
-        )
-        if entry is not None and entry.cross_pe is not None:
-            cross_pe = entry.cross_pe
-        else:
-            cross_pe = sp._prepare_positional_embeddings(
+        # Cross-PE: constant across steps, cached in same entry.
+        entry = sp._text_cache.get_preproc(cfg_pass, sp._modality)
+        if entry.cross_pe is None:
+            entry.cross_pe = sp._prepare_positional_embeddings(
                 positions=modality.positions[:, 0:1, :],
                 inner_dim=self.audio_cross_attention_dim,
                 max_pos=[self.cross_pe_max_pos],
@@ -247,8 +235,7 @@ class MultiModalTransformerArgsPreprocessor:
                 num_attention_heads=sp.num_attention_heads,
                 x_dtype=modality.latent.dtype,
             )
-            if entry is not None:
-                entry.cross_pe = cross_pe
+        cross_pe = entry.cross_pe
 
         cross_scale_shift_timestep, cross_gate_timestep = self._prepare_cross_attention_timestep(
             timestep=modality.timesteps,

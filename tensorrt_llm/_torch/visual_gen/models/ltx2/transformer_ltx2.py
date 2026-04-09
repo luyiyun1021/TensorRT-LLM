@@ -534,7 +534,6 @@ class BasicAVTransformerBlock(nn.Module):
             vx = vx + self.attn2(
                 rms_norm(vx, eps=self.norm_eps),
                 pre_projected_kv=text_kv_video,
-                context=video.context if text_kv_video is None else None,
             )
             del vshift_msa, vscale_msa, vgate_msa
 
@@ -559,7 +558,6 @@ class BasicAVTransformerBlock(nn.Module):
             ax = ax + self.audio_attn2(
                 rms_norm(ax, eps=self.norm_eps),
                 pre_projected_kv=text_kv_audio,
-                context=audio.context if text_kv_audio is None else None,
             )
             del ashift_msa, ascale_msa, agate_msa
 
@@ -1194,7 +1192,7 @@ class LTXModel(nn.Module):
         audio: Modality | None,
         perturbations=None,
         text_cache: "LTX2TextContextCache" = None,
-        cfg_pass: "CfgPass" = None,
+        cfg_pass: "CfgPass" = CfgPass.COND,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Forward pass through the LTX-2 transformer.
 
@@ -1230,8 +1228,7 @@ class LTXModel(nn.Module):
                 audio_args = self._shard_transformer_args(audio_args)
 
         # Fill text KV cache outside torch.compile.
-        use_cache = text_cache is not None
-        if use_cache and text_cache.kv_is_dirty(cfg_pass):
+        if text_cache.kv_is_dirty(cfg_pass):
             v_ctx = video_args.context if video_args is not None else None
             a_ctx = audio_args.context if audio_args is not None else None
             for i, block in enumerate(self.transformer_blocks):
@@ -1250,12 +1247,12 @@ class LTXModel(nn.Module):
                 perturbations=perturbations,
                 text_kv_video=(
                     text_cache.get_kv(ModalityType.VIDEO, cfg_pass, i)
-                    if use_cache and video_args is not None
+                    if video_args is not None
                     else None
                 ),
                 text_kv_audio=(
                     text_cache.get_kv(ModalityType.AUDIO, cfg_pass, i)
-                    if use_cache and audio_args is not None
+                    if audio_args is not None
                     else None
                 ),
             )

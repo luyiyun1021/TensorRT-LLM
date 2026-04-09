@@ -59,6 +59,20 @@ def _create_model_config(backend: str = "VANILLA") -> DiffusionModelConfig:
     )
 
 
+def _inject_text_cache(model, num_layers):
+    """Create and inject a text context cache into the model."""
+    from tensorrt_llm._torch.visual_gen.models.ltx2.text_context_cache import (
+        LTX2TextContextCache,
+        ModalityType,
+    )
+
+    cache = LTX2TextContextCache(num_layers=num_layers)
+    model.video_args_preprocessor.set_text_cache(cache, ModalityType.VIDEO)
+    if hasattr(model, "audio_args_preprocessor"):
+        model.audio_args_preprocessor.set_text_cache(cache, ModalityType.AUDIO)
+    return cache
+
+
 def _init_all_weights(model: torch.nn.Module, std: float = 0.02):
     """Initialize all parameters with small random values.
 
@@ -167,6 +181,7 @@ class TestLTX2VideoOnlyModel(unittest.TestCase):
             .eval()
         )
         _init_all_weights(model)
+        cache = _inject_text_cache(model, VIDEO_ONLY_CONFIG["num_layers"])
 
         batch = 1
         n_frames, grid_h, grid_w = 1, 4, 4
@@ -187,7 +202,7 @@ class TestLTX2VideoOnlyModel(unittest.TestCase):
         )
 
         with torch.no_grad():
-            video_out, audio_out = model(video=video_modality, audio=None)
+            video_out, audio_out = model(video=video_modality, audio=None, text_cache=cache)
 
         self.assertIsNotNone(video_out)
         self.assertIsNone(audio_out)
@@ -261,6 +276,7 @@ class TestLTX2AudioVideoModel(unittest.TestCase):
             .eval()
         )
         _init_all_weights(model)
+        cache = _inject_text_cache(model, AUDIO_VIDEO_CONFIG["num_layers"])
 
         batch = 1
         v_frames, v_h, v_w = 1, 4, 4
@@ -290,7 +306,9 @@ class TestLTX2AudioVideoModel(unittest.TestCase):
         )
 
         with torch.no_grad():
-            video_out, audio_out = model(video=video_modality, audio=audio_modality)
+            video_out, audio_out = model(
+                video=video_modality, audio=audio_modality, text_cache=cache
+            )
 
         self.assertIsNotNone(video_out)
         self.assertIsNotNone(audio_out)
@@ -326,6 +344,7 @@ class TestLTX2AudioVideoModel(unittest.TestCase):
             .eval()
         )
         _init_all_weights(model)
+        cache = _inject_text_cache(model, AUDIO_VIDEO_CONFIG["num_layers"])
 
         batch = 1
         v_frames, v_h, v_w = 1, 4, 4
@@ -344,7 +363,7 @@ class TestLTX2AudioVideoModel(unittest.TestCase):
         )
 
         with torch.no_grad():
-            video_out, audio_out = model(video=video_modality, audio=None)
+            video_out, audio_out = model(video=video_modality, audio=None, text_cache=cache)
 
         self.assertIsNotNone(video_out)
         self.assertIsNone(audio_out)
@@ -533,10 +552,7 @@ class TestLTX2TextContextCache(unittest.TestCase):
         3. Two CFG slots produce different outputs for different contexts.
         """
         from tensorrt_llm._torch.visual_gen.models.ltx2.ltx2_core.modality import Modality
-        from tensorrt_llm._torch.visual_gen.models.ltx2.text_context_cache import (
-            CfgPass,
-            LTX2TextContextCache,
-        )
+        from tensorrt_llm._torch.visual_gen.models.ltx2.text_context_cache import CfgPass
         from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import (
             LTXModel,
             LTXModelType,
@@ -554,14 +570,7 @@ class TestLTX2TextContextCache(unittest.TestCase):
         )
         _init_all_weights(model)
 
-        num_layers = AUDIO_VIDEO_CONFIG["num_layers"]
-        cache = LTX2TextContextCache(num_layers=num_layers)
-
-        # Inject cache (normally done by pipeline).
-        from tensorrt_llm._torch.visual_gen.models.ltx2.text_context_cache import ModalityType
-
-        model.video_args_preprocessor.set_text_cache(cache, ModalityType.VIDEO)
-        model.audio_args_preprocessor.set_text_cache(cache, ModalityType.AUDIO)
+        cache = _inject_text_cache(model, AUDIO_VIDEO_CONFIG["num_layers"])
 
         batch, v_frames, v_h, v_w = 1, 1, 4, 4
         v_patches, a_patches, text_len = v_frames * v_h * v_w, 8, 8
@@ -642,6 +651,37 @@ class TestLTX2TextContextCache(unittest.TestCase):
             )
 
         self.assertFalse(torch.equal(v_cond, v_uncond), "CFG slots must differ")
+
+        with torch.no_grad():
+            # -- Part 4: Single-GPU CFG simulation --
+            # Cond → uncond → cond within same denoising loop (no invalidate).
+            # Verifies that alternating cfg_pass does not pollute the cache.
+            cache.invalidate()
+
+            # Step 1: cond + uncond
+            torch.manual_seed(300)
+            v_cond_1, _ = model(
+                *make_mods(0.8, v_ctx_A, a_ctx_A), text_cache=cache, cfg_pass=CfgPass.COND
+            )
+            torch.manual_seed(300)
+            v_uncond_1, _ = model(
+                *make_mods(0.8, v_ctx_B, a_ctx_B), text_cache=cache, cfg_pass=CfgPass.UNCOND
+            )
+
+            # Step 2: cond + uncond (should reuse cached KV from step 1)
+            torch.manual_seed(400)
+            v_cond_2, _ = model(
+                *make_mods(0.7, v_ctx_A, a_ctx_A), text_cache=cache, cfg_pass=CfgPass.COND
+            )
+            torch.manual_seed(400)
+            v_uncond_2, _ = model(
+                *make_mods(0.7, v_ctx_B, a_ctx_B), text_cache=cache, cfg_pass=CfgPass.UNCOND
+            )
+
+        # Cond outputs differ between steps (different latent/timestep).
+        self.assertFalse(torch.equal(v_cond_1, v_cond_2), "Steps should differ")
+        # Cond != uncond within same step.
+        self.assertFalse(torch.equal(v_cond_2, v_uncond_2), "CFG cond != uncond")
 
 
 if __name__ == "__main__":

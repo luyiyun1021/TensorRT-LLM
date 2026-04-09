@@ -34,6 +34,7 @@ from .ltx2_core.types import (
 from .ltx2_core.upsampler import LatentUpsamplerConfigurator, upsample_video
 from .ltx2_core.video_vae import TilingConfig
 from .pipeline_ltx2 import LTX2Pipeline, _assert_resolution, _find_safetensors_files
+from .text_context_cache import CfgPass
 
 STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
 
@@ -693,6 +694,10 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         )
         logger.info(f"Merged distilled LoRA ({n} params) for stage 2")
 
+        # LoRA changed KV projection weights — invalidate text cache so
+        # Stage 2 refills with the merged weights.
+        self._text_cache.invalidate()
+
         # Disable Ulysses for Stage 2: only rank 0 is active, so
         # cross-rank collectives in the attention backend would hang.
         self.transformer.set_ulysses_enabled(False)
@@ -941,6 +946,8 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             vel_v, vel_a = self.transformer(
                 video=video_mod,
                 audio=audio_mod,
+                text_cache=self._text_cache,
+                cfg_pass=CfgPass.COND,
             )
 
             # Video: velocity → x0 → post-process → Euler step
