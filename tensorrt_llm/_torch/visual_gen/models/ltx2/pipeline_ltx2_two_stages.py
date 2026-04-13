@@ -14,6 +14,7 @@ from tensorrt_llm._torch.visual_gen.output import MediaOutput
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
 from tensorrt_llm._torch.visual_gen.quantization.ops import quantize_fp8_blockwise, quantize_nvfp4
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
+from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.utils.fp8_utils import (
     align,
@@ -915,63 +916,64 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
 
         # --- Euler denoising loop (no guidance) ---
         for i in range(len(sigmas) - 1):
-            sigma = sigmas[i]
-            sigma_next = sigmas[i + 1]
-            dt = sigma_next - sigma
-            timestep = sigma.unsqueeze(0).expand(v_working.shape[0])
+            with nvtx_range(f"refinement_step {i}"):
+                sigma = sigmas[i]
+                sigma_next = sigmas[i + 1]
+                dt = sigma_next - sigma
+                timestep = sigma.unsqueeze(0).expand(v_working.shape[0])
 
-            if denoise_mask is not None:
-                v_timestep = denoise_mask * sigma
-            else:
-                v_timestep = timestep
+                if denoise_mask is not None:
+                    v_timestep = denoise_mask * sigma
+                else:
+                    v_timestep = timestep
 
-            video_mod = Modality(
-                latent=v_working.to(self.dtype),
-                timesteps=v_timestep,
-                positions=video_positions,
-                context=video_embeds,
-                context_mask=connector_mask,
-            )
-
-            audio_mod = None
-            if a_working is not None:
-                audio_mod = Modality(
-                    latent=a_working.to(self.dtype),
-                    timesteps=timestep,
-                    positions=audio_positions,
-                    context=audio_embeds,
+                video_mod = Modality(
+                    latent=v_working.to(self.dtype),
+                    timesteps=v_timestep,
+                    positions=video_positions,
+                    context=video_embeds,
                     context_mask=connector_mask,
                 )
 
-            vel_v, vel_a = self.transformer(
-                video=video_mod,
-                audio=audio_mod,
-                text_cache=self._text_cache,
-                cfg_pass=CfgPass.COND,
-            )
+                audio_mod = None
+                if a_working is not None:
+                    audio_mod = Modality(
+                        latent=a_working.to(self.dtype),
+                        timesteps=timestep,
+                        positions=audio_positions,
+                        context=audio_embeds,
+                        context_mask=connector_mask,
+                    )
 
-            # Video: velocity → x0 → post-process → Euler step
-            sigma_v = sigma.float()
-            while sigma_v.dim() < vel_v.dim():
-                sigma_v = sigma_v.unsqueeze(-1)
+                vel_v, vel_a = self.transformer(
+                    video=video_mod,
+                    audio=audio_mod,
+                    text_cache=self._text_cache,
+                    cfg_pass=CfgPass.COND,
+                )
 
-            denoised_v = v_working.float() - vel_v.float() * sigma_v
+                # Video: velocity → x0 → post-process → Euler step
+                sigma_v = sigma.float()
+                while sigma_v.dim() < vel_v.dim():
+                    sigma_v = sigma_v.unsqueeze(-1)
 
-            if denoise_mask is not None and clean_latent is not None:
-                dm = denoise_mask.unsqueeze(-1)
-                denoised_v = denoised_v * dm + clean_latent.float() * (1.0 - dm)
+                denoised_v = v_working.float() - vel_v.float() * sigma_v
 
-            velocity_v = (v_working.float() - denoised_v) / sigma_v
-            v_working = (v_working.float() + velocity_v * dt).to(v_working.dtype)
+                if denoise_mask is not None and clean_latent is not None:
+                    dm = denoise_mask.unsqueeze(-1)
+                    denoised_v = denoised_v * dm + clean_latent.float() * (1.0 - dm)
 
-            # Audio: velocity → x0 → Euler step
-            if vel_a is not None and a_working is not None:
-                sigma_a = sigma.float()
-                while sigma_a.dim() < vel_a.dim():
-                    sigma_a = sigma_a.unsqueeze(-1)
-                denoised_a = a_working.float() - vel_a.float() * sigma_a
-                velocity_a = (a_working.float() - denoised_a) / sigma_a
-                a_working = (a_working.float() + velocity_a * dt).to(a_working.dtype)
+                velocity_v = (v_working.float() - denoised_v) / sigma_v
+                v_working = (v_working.float() + velocity_v * dt).to(v_working.dtype)
+
+                # Audio: velocity → x0 → Euler step
+                if vel_a is not None and a_working is not None:
+                    sigma_a = sigma.float()
+                    while sigma_a.dim() < vel_a.dim():
+                        sigma_a = sigma_a.unsqueeze(-1)
+                    denoised_a = a_working.float() - vel_a.float() * sigma_a
+                    velocity_a = (a_working.float() - denoised_a) / sigma_a
+                    a_working = (a_working.float() + velocity_a * dt).to(a_working.dtype)
 
         # --- Unpatchify ---
         video_out = self.video_patchifier.unpatchify(v_working, video_shape)
