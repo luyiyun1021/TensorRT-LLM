@@ -1,61 +1,114 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
 
-"""LTX2 text context cache — caches constant text-derived computations across denoise steps.
+"""LTX2 text context cache — fixed [2,...] shared buffer design.
 
-Text context (prompt embeddings) is constant throughout the denoising loop.
-This module caches two levels of derived computation:
-
-1. **Preprocessor outputs** (per modality): ``caption_projection(context)``,
-   attention mask, RoPE positional embeddings, and cross-PE.
-2. **Per-block KV projections** (per layer per modality): ``to_k(context)``,
-   ``to_v(context)``, and ``norm_k(k)`` for text cross-attention.
-
-Supports 2 CFG slots (conditional + unconditional) so that single-GPU CFG
-does not pollute the cache.
-
-Lifecycle:
-- Created once by the pipeline (survives across requests).
-- ``invalidate()`` marks all slots dirty before each denoising loop.
-  Buffers are retained for reuse via ``copy_()``.
-- ``LTXModel.forward()`` computes KV projections and stores via ``store_kv()``.
-- Compiled blocks read via ``get_kv()``.
+All buffers have batch=2 regardless of CFG mode.  COND/UNCOND write to
+their respective slice; BOTH writes the full buffer.  No grow/shrink.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
+from typing import Optional
 
 import torch
 
+# Batch indices: BasePipeline concats [neg, pos] → 0=UNCOND, 1=COND.
+_UNCOND_IDX = 0
+_COND_IDX = 1
+
 
 class CfgPass(IntEnum):
-    """CFG pass type — used as cache slot index."""
+    """CFG pass type."""
 
     COND = 0
     UNCOND = 1
+    BOTH = 2
 
 
 class ModalityType(IntEnum):
-    """Modality type — used as cache dimension index."""
+    """Modality type."""
 
     VIDEO = 0
     AUDIO = 1
 
 
+def _cfg_slice(cfg_pass: CfgPass) -> slice:
+    """Return batch slice for a CFG pass."""
+    if cfg_pass == CfgPass.COND:
+        return slice(_COND_IDX, _COND_IDX + 1)
+    if cfg_pass == CfgPass.UNCOND:
+        return slice(_UNCOND_IDX, _UNCOND_IDX + 1)
+    return slice(None)  # BOTH
+
+
 @dataclass
 class _PreprocEntry:
-    """Cached preprocessor outputs for one modality in one CFG slot."""
+    """Preprocessor cache entry.  All tensors have batch=2 when filled."""
 
-    context: torch.Tensor | None = None
-    mask: torch.Tensor | None = None
-    pe: tuple[torch.Tensor, torch.Tensor] | None = None
-    cross_pe: tuple[torch.Tensor, torch.Tensor] | None = None
+    context: Optional[torch.Tensor] = None
+    mask: Optional[torch.Tensor] = None
+    pe: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+    cross_pe: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+
+    @property
+    def is_filled(self) -> bool:
+        return self.context is not None
+
+    def get(self, s: slice) -> _PreprocEntry:
+        """Return sliced view."""
+        if not self.is_filled:
+            return _PreprocEntry()
+
+        def _sl(t):
+            return t[s] if t is not None else None
+
+        def _sl2(p):
+            return (p[0][s], p[1][s]) if p is not None else None
+
+        return _PreprocEntry(
+            context=_sl(self.context),
+            mask=_sl(self.mask),
+            pe=_sl2(self.pe),
+            cross_pe=_sl2(self.cross_pe),
+        )
+
+    def copy_slice(self, s: slice, src: _PreprocEntry) -> None:
+        """Copy src into this entry's slice in-place."""
+        if src.context is not None and self.context is not None:
+            self.context[s].copy_(src.context)
+        if src.mask is not None and self.mask is not None:
+            self.mask[s].copy_(src.mask)
+        if src.pe is not None and self.pe is not None:
+            self.pe[0][s].copy_(src.pe[0])
+            self.pe[1][s].copy_(src.pe[1])
+        # cross_pe handled separately by MultiModal preprocessor
+
+
+def _expand2(t: torch.Tensor) -> torch.Tensor:
+    """Repeat batch=1 tensor to batch=2."""
+    return t.repeat(2, *([1] * (t.dim() - 1)))
+
+
+def _alloc_batch2(src: _PreprocEntry) -> _PreprocEntry:
+    """Allocate batch=2 entry from a source (batch=1 or batch=2)."""
+    if src.context.shape[0] == 2:
+        return _PreprocEntry(
+            context=src.context.clone(),
+            mask=src.mask.clone() if src.mask is not None else None,
+            pe=(src.pe[0].clone(), src.pe[1].clone()) if src.pe is not None else None,
+        )
+    return _PreprocEntry(
+        context=_expand2(src.context),
+        mask=_expand2(src.mask) if src.mask is not None else None,
+        pe=(_expand2(src.pe[0]), _expand2(src.pe[1])) if src.pe is not None else None,
+    )
 
 
 class LTX2TextContextCache:
-    """Caches text-derived computations across denoise steps.
+    """Fixed [2,...] shared buffer cache.
 
     Args:
         num_layers: Number of transformer blocks.
@@ -63,43 +116,68 @@ class LTX2TextContextCache:
 
     def __init__(self, num_layers: int) -> None:
         self.num_layers = num_layers
+        n_mod = len(ModalityType)
 
-        num_slots = len(CfgPass)
-        num_modalities = len(ModalityType)
+        self._preproc: list[_PreprocEntry] = [_PreprocEntry() for _ in range(n_mod)]
+        self._preproc_dirty: list[bool] = [True, True]  # [COND, UNCOND]
 
-        # Preprocessor cache: [cfg_pass][modality] → _PreprocEntry
-        self._preproc: list[list[_PreprocEntry]] = [
-            [_PreprocEntry() for _ in range(num_modalities)] for _ in range(num_slots)
+        self._kv: list[list[Optional[tuple[torch.Tensor, torch.Tensor]]]] = [
+            [None] * num_layers for _ in range(n_mod)
         ]
-
-        # Per-block KV cache: [cfg_pass][modality][layer] → (k, v) | None
-        self._kv: list[list[list[tuple[torch.Tensor, torch.Tensor] | None]]] = [
-            [[None] * num_layers for _ in range(num_modalities)] for _ in range(num_slots)
-        ]
-        self._kv_dirty: list[bool] = [True] * num_slots
+        self._kv_dirty: list[bool] = [True, True]
 
     def invalidate(self) -> None:
-        """Mark all slots dirty.  Buffers are retained for ``copy_()`` reuse."""
-        for s in CfgPass:
-            for m in ModalityType:
-                self._preproc[s][m] = _PreprocEntry()
-            self._kv_dirty[s] = True
+        """Mark all dirty.  Buffers retained."""
+        for m in ModalityType:
+            self._preproc[m] = _PreprocEntry()
+        self._preproc_dirty = [True, True]
+        self._kv_dirty = [True, True]
 
-    # -- Preprocessor cache ------------------------------------------------
+    # -- Preprocessor ------------------------------------------------------
 
     def get_preproc(self, cfg_pass: CfgPass, modality: ModalityType) -> _PreprocEntry:
-        """Return the preprocessor cache entry for reading/writing."""
-        return self._preproc[cfg_pass][modality]
+        """Return sliced view of preprocessor entry.  Empty if slot is dirty."""
+        if cfg_pass == CfgPass.BOTH:
+            if self._preproc_dirty[CfgPass.COND] or self._preproc_dirty[CfgPass.UNCOND]:
+                return _PreprocEntry()
+        elif self._preproc_dirty[cfg_pass]:
+            return _PreprocEntry()
+        entry = self._preproc[modality]
+        if not entry.is_filled:
+            return _PreprocEntry()
+        return entry.get(_cfg_slice(cfg_pass))
 
-    # -- KV cache ----------------------------------------------------------
+    def store_preproc(self, cfg_pass: CfgPass, modality: ModalityType, src: _PreprocEntry) -> None:
+        """Store preprocessor outputs into shared [2,...] buffer."""
+        entry = self._preproc[modality]
+        s = _cfg_slice(cfg_pass)
 
-    def kv_is_dirty(self, cfg_pass: CfgPass) -> bool:
-        """Return True if this slot needs KV refill."""
+        if entry.is_filled and entry.context.shape[1:] == src.context.shape[1:]:
+            entry.copy_slice(s, src)
+        else:
+            new_entry = _alloc_batch2(src)
+            new_entry.copy_slice(s, src)
+            self._preproc[modality] = new_entry
+
+        if cfg_pass == CfgPass.BOTH:
+            self._preproc_dirty[CfgPass.COND] = False
+            self._preproc_dirty[CfgPass.UNCOND] = False
+        else:
+            self._preproc_dirty[cfg_pass] = False
+
+    # -- KV ----------------------------------------------------------------
+
+    def kv_is_dirty(self, cfg_pass: CfgPass = CfgPass.COND) -> bool:
+        if cfg_pass == CfgPass.BOTH:
+            return self._kv_dirty[CfgPass.COND] or self._kv_dirty[CfgPass.UNCOND]
         return self._kv_dirty[cfg_pass]
 
-    def kv_mark_clean(self, cfg_pass: CfgPass) -> None:
-        """Mark this slot as filled.  Call after storing all layers."""
-        self._kv_dirty[cfg_pass] = False
+    def kv_mark_clean(self, cfg_pass: CfgPass = CfgPass.COND) -> None:
+        if cfg_pass == CfgPass.BOTH:
+            self._kv_dirty[CfgPass.COND] = False
+            self._kv_dirty[CfgPass.UNCOND] = False
+        else:
+            self._kv_dirty[cfg_pass] = False
 
     def store_kv(
         self,
@@ -109,21 +187,27 @@ class LTX2TextContextCache:
         k: torch.Tensor,
         v: torch.Tensor,
     ) -> None:
-        """Store KV for one layer.  Reuses buffer when shapes match.
+        """Store KV into shared [2,...] buffer."""
+        s = _cfg_slice(cfg_pass)
+        existing = self._kv[modality][layer_idx]
 
-        When batch size changes across stages (e.g. Stage 1 CFG concat
-        batch=2 → Stage 2 batch=1), the buffer is reallocated instead of
-        using ``copy_()`` which would silently broadcast.
-        """
-        existing = self._kv[cfg_pass][modality][layer_idx]
-        if existing is not None and existing[0].shape == k.shape:
-            existing[0].copy_(k)
-            existing[1].copy_(v)
+        if existing is not None and existing[0].shape[1:] == k.shape[1:]:
+            existing[0][s].copy_(k)
+            existing[1][s].copy_(v)
         else:
-            self._kv[cfg_pass][modality][layer_idx] = (k.clone(), v.clone())
+            if k.shape[0] == 2:
+                self._kv[modality][layer_idx] = (k.clone(), v.clone())
+            else:
+                buf_k = _expand2(k)
+                buf_v = _expand2(v)
+                buf_k[s].copy_(k)
+                buf_v[s].copy_(v)
+                self._kv[modality][layer_idx] = (buf_k, buf_v)
 
     def get_kv(
         self, modality: ModalityType, cfg_pass: CfgPass, layer_idx: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return cached KV for a compiled block."""
-        return self._kv[cfg_pass][modality][layer_idx]
+        """Return sliced KV view."""
+        k, v = self._kv[modality][layer_idx]
+        s = _cfg_slice(cfg_pass)
+        return k[s], v[s]

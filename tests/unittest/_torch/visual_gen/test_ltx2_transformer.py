@@ -809,6 +809,55 @@ class TestLTX2TextContextCache(unittest.TestCase):
         # Cond != uncond within same step.
         self.assertFalse(torch.equal(v_cond_2, v_uncond_2), "CFG cond != uncond")
 
+        def make_mods_b2(ts):
+            """Create batch=2 modalities for BOTH mode."""
+            return (
+                Modality(
+                    latent=torch.randn(2, v_patches, in_ch, device=self.DEVICE, dtype=dtype) * 0.02,
+                    timesteps=torch.tensor([ts, ts], device=self.DEVICE),
+                    positions=v_pos.expand(2, -1, -1, -1),
+                    context=v_ctx_A.expand(2, -1, -1),
+                ),
+                Modality(
+                    latent=torch.randn(2, a_patches, a_in_ch, device=self.DEVICE, dtype=dtype)
+                    * 0.02,
+                    timesteps=torch.tensor([ts, ts], device=self.DEVICE),
+                    positions=a_pos.expand(2, -1, -1, -1),
+                    context=a_ctx_A.expand(2, -1, -1),
+                ),
+            )
+
+        with torch.no_grad():
+            # -- Part 5: BOTH (batch=2) → invalidate → COND (batch=1) --
+            # Simulates Stage 1 CFG concat → Stage 2 no-CFG transition.
+            cache.invalidate()
+            torch.manual_seed(500)
+            v_both, _ = model(*make_mods_b2(0.8), text_cache=cache, cfg_pass=CfgPass.BOTH)
+            self.assertEqual(v_both.shape[0], 2, "BOTH should output batch=2")
+
+            # BOTH cache hit
+            torch.manual_seed(600)
+            v_both2, _ = model(*make_mods_b2(0.5), text_cache=cache, cfg_pass=CfgPass.BOTH)
+            self.assertEqual(v_both2.shape[0], 2)
+
+            # invalidate → COND (batch=1) — simulates Stage 2
+            cache.invalidate()
+            torch.manual_seed(700)
+            v_s2, _ = model(
+                *make_mods(0.5, v_ctx_A, a_ctx_A), text_cache=cache, cfg_pass=CfgPass.COND
+            )
+            self.assertEqual(v_s2.shape[0], 1, "Stage 2 COND should be batch=1")
+
+            # COND cache hit — must be bitwise identical
+            torch.manual_seed(700)
+            v_s2b, _ = model(
+                *make_mods(0.5, v_ctx_A, a_ctx_A), text_cache=cache, cfg_pass=CfgPass.COND
+            )
+            self.assertTrue(
+                torch.equal(v_s2, v_s2b),
+                f"Stage 2 COND cache hit not identical. Diff: {(v_s2 - v_s2b).abs().max():.6e}",
+            )
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

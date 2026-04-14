@@ -1533,6 +1533,10 @@ class LTX2Pipeline(BasePipeline):
             step_counter[0] += 1
 
             if not use_multi_modal_guidance or video_guider.should_skip_step(cur_step):
+                # BasePipeline concatenates [uncond, cond] into batch=2
+                # when guidance_scale > 1.  Use BOTH so the cache splits
+                # into per-slot storage correctly.
+                bp_cfg = CfgPass.BOTH if video_latents.shape[0] > 1 else CfgPass.COND
                 dn_v, dn_a = _run_transformer(
                     video_latents,
                     audio_latents_in,
@@ -1540,6 +1544,7 @@ class LTX2Pipeline(BasePipeline):
                     encoder_hidden_states,
                     extra_tensors.get("audio_embeds", audio_embeds),
                     extra_tensors.get("attention_mask", connector_mask),
+                    cfg_pass=bp_cfg,
                 )
                 return dn_v, {"audio": dn_a}
 
