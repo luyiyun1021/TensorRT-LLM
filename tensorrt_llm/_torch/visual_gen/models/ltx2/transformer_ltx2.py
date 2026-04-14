@@ -1228,7 +1228,7 @@ class LTXModel(nn.Module):
                 audio_args = self._shard_transformer_args(audio_args)
 
         # Fill text KV cache outside torch.compile.
-        if text_cache is not None and text_cache.kv_is_dirty(cfg_pass):
+        if text_cache.kv_is_dirty(cfg_pass):
             v_ctx = video_args.context if video_args is not None else None
             a_ctx = audio_args.context if audio_args is not None else None
             for i, block in enumerate(self.transformer_blocks):
@@ -1247,12 +1247,12 @@ class LTXModel(nn.Module):
                 perturbations=perturbations,
                 text_kv_video=(
                     text_cache.get_kv(ModalityType.VIDEO, cfg_pass, i)
-                    if text_cache is not None and video_args is not None
+                    if video_args is not None
                     else None
                 ),
                 text_kv_audio=(
                     text_cache.get_kv(ModalityType.AUDIO, cfg_pass, i)
-                    if text_cache is not None and audio_args is not None
+                    if audio_args is not None
                     else None
                 ),
             )
