@@ -109,9 +109,14 @@ class LTX2TextContextCache:
         k: torch.Tensor,
         v: torch.Tensor,
     ) -> None:
-        """Store KV for one layer.  Reuses buffer on subsequent calls."""
+        """Store KV for one layer.  Reuses buffer when shapes match.
+
+        When batch size changes across stages (e.g. Stage 1 CFG concat
+        batch=2 → Stage 2 batch=1), the buffer is reallocated instead of
+        using ``copy_()`` which would silently broadcast.
+        """
         existing = self._kv[cfg_pass][modality][layer_idx]
-        if existing is not None:
+        if existing is not None and existing[0].shape == k.shape:
             existing[0].copy_(k)
             existing[1].copy_(v)
         else:
