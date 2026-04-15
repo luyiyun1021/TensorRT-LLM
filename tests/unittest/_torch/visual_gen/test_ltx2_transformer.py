@@ -59,20 +59,6 @@ def _create_model_config(backend: str = "VANILLA") -> DiffusionModelConfig:
     )
 
 
-def _inject_text_cache(model, num_layers):
-    """Create and inject a text context cache into the model."""
-    from tensorrt_llm._torch.visual_gen.models.ltx2.text_context_cache import (
-        LTX2TextContextCache,
-        ModalityType,
-    )
-
-    cache = LTX2TextContextCache(num_layers=num_layers)
-    model.video_args_preprocessor.set_text_cache(cache, ModalityType.VIDEO)
-    if hasattr(model, "audio_args_preprocessor"):
-        model.audio_args_preprocessor.set_text_cache(cache, ModalityType.AUDIO)
-    return cache
-
-
 def _init_all_weights(model: torch.nn.Module, std: float = 0.02):
     """Initialize all parameters with small random values.
 
@@ -181,7 +167,6 @@ class TestLTX2VideoOnlyModel(unittest.TestCase):
             .eval()
         )
         _init_all_weights(model)
-        cache = _inject_text_cache(model, VIDEO_ONLY_CONFIG["num_layers"])
 
         batch = 1
         n_frames, grid_h, grid_w = 1, 4, 4
@@ -202,7 +187,7 @@ class TestLTX2VideoOnlyModel(unittest.TestCase):
         )
 
         with torch.no_grad():
-            video_out, audio_out = model(video=video_modality, audio=None, text_cache=cache)
+            video_out, audio_out = model(video=video_modality, audio=None)
 
         self.assertIsNotNone(video_out)
         self.assertIsNone(audio_out)
@@ -276,7 +261,6 @@ class TestLTX2AudioVideoModel(unittest.TestCase):
             .eval()
         )
         _init_all_weights(model)
-        cache = _inject_text_cache(model, AUDIO_VIDEO_CONFIG["num_layers"])
 
         batch = 1
         v_frames, v_h, v_w = 1, 4, 4
@@ -306,9 +290,7 @@ class TestLTX2AudioVideoModel(unittest.TestCase):
         )
 
         with torch.no_grad():
-            video_out, audio_out = model(
-                video=video_modality, audio=audio_modality, text_cache=cache
-            )
+            video_out, audio_out = model(video=video_modality, audio=audio_modality)
 
         self.assertIsNotNone(video_out)
         self.assertIsNotNone(audio_out)
@@ -344,7 +326,6 @@ class TestLTX2AudioVideoModel(unittest.TestCase):
             .eval()
         )
         _init_all_weights(model)
-        cache = _inject_text_cache(model, AUDIO_VIDEO_CONFIG["num_layers"])
 
         batch = 1
         v_frames, v_h, v_w = 1, 4, 4
@@ -363,7 +344,7 @@ class TestLTX2AudioVideoModel(unittest.TestCase):
         )
 
         with torch.no_grad():
-            video_out, audio_out = model(video=video_modality, audio=None, text_cache=cache)
+            video_out, audio_out = model(video=video_modality, audio=None)
 
         self.assertIsNotNone(video_out)
         self.assertIsNone(audio_out)
@@ -573,7 +554,7 @@ class TestLTX2CUDAGraphCapture(unittest.TestCase):
             .eval()
         )
         _init_all_weights(model)
-        cache = _inject_text_cache(model, AUDIO_VIDEO_CONFIG["num_layers"])
+        cache = model._text_cache
 
         batch = 1
         v_frames, v_h, v_w = 1, 4, 4
@@ -614,7 +595,7 @@ class TestLTX2CUDAGraphCapture(unittest.TestCase):
         video_mod, audio_mod = _make_modalities(0.5)
         cache.invalidate()
         with torch.no_grad():
-            eager_v, eager_a = model(video=video_mod, audio=audio_mod, text_cache=cache)
+            eager_v, eager_a = model(video=video_mod, audio=audio_mod)
         eager_v = eager_v.clone()
         eager_a = eager_a.clone()
 
@@ -628,7 +609,7 @@ class TestLTX2CUDAGraphCapture(unittest.TestCase):
         video_mod, audio_mod = _make_modalities(0.5)
         cache.invalidate()
         with torch.no_grad():
-            graph_v1, graph_a1 = model(video=video_mod, audio=audio_mod, text_cache=cache)
+            graph_v1, graph_a1 = model(video=video_mod, audio=audio_mod)
 
         self.assertTrue(
             torch.equal(eager_v, graph_v1),
@@ -647,7 +628,7 @@ class TestLTX2CUDAGraphCapture(unittest.TestCase):
         model.forward = original_forward
         cache.invalidate()
         with torch.no_grad():
-            eager_v2, eager_a2 = model(video=video_mod2, audio=audio_mod2, text_cache=cache)
+            eager_v2, eager_a2 = model(video=video_mod2, audio=audio_mod2)
         eager_v2 = eager_v2.clone()
         eager_a2 = eager_a2.clone()
 
@@ -657,7 +638,7 @@ class TestLTX2CUDAGraphCapture(unittest.TestCase):
         video_mod2, audio_mod2 = _make_modalities(0.3)
         cache.invalidate()
         with torch.no_grad():
-            graph_v2, graph_a2 = model(video=video_mod2, audio=audio_mod2, text_cache=cache)
+            graph_v2, graph_a2 = model(video=video_mod2, audio=audio_mod2)
 
         self.assertTrue(
             torch.equal(eager_v2, graph_v2),
@@ -701,7 +682,7 @@ class TestLTX2TextContextCache(unittest.TestCase):
         )
         _init_all_weights(model)
 
-        cache = _inject_text_cache(model, AUDIO_VIDEO_CONFIG["num_layers"])
+        cache = model._text_cache
 
         batch, v_frames, v_h, v_w = 1, 1, 4, 4
         v_patches, a_patches, text_len = v_frames * v_h * v_w, 8, 8
@@ -736,18 +717,14 @@ class TestLTX2TextContextCache(unittest.TestCase):
         with torch.no_grad():
             # -- Part 1: cache hit == no cache (bitwise) --
             torch.manual_seed(100)
-            model(*make_mods(0.8, v_ctx_A, a_ctx_A), text_cache=cache, cfg_pass=CfgPass.COND)
+            model(*make_mods(0.8, v_ctx_A, a_ctx_A), cfg_pass=CfgPass.COND)
             torch.manual_seed(200)
-            v_cached, a_cached = model(
-                *make_mods(0.5, v_ctx_A, a_ctx_A), text_cache=cache, cfg_pass=CfgPass.COND
-            )
+            v_cached, a_cached = model(*make_mods(0.5, v_ctx_A, a_ctx_A), cfg_pass=CfgPass.COND)
 
             # Invalidate and re-run — cache refills from scratch
             cache.invalidate()
             torch.manual_seed(200)
-            v_nocache, a_nocache = model(
-                *make_mods(0.5, v_ctx_A, a_ctx_A), text_cache=cache, cfg_pass=CfgPass.COND
-            )
+            v_nocache, a_nocache = model(*make_mods(0.5, v_ctx_A, a_ctx_A), cfg_pass=CfgPass.COND)
 
         self.assertTrue(
             torch.equal(v_cached, v_nocache),
@@ -762,9 +739,7 @@ class TestLTX2TextContextCache(unittest.TestCase):
             # -- Part 2: different context after invalidate --
             cache.invalidate()
             torch.manual_seed(200)
-            v_B, a_B = model(
-                *make_mods(0.5, v_ctx_B, a_ctx_B), text_cache=cache, cfg_pass=CfgPass.COND
-            )
+            v_B, a_B = model(*make_mods(0.5, v_ctx_B, a_ctx_B), cfg_pass=CfgPass.COND)
 
         self.assertFalse(torch.equal(v_nocache, v_B), "Video: cache may be stale")
         self.assertFalse(torch.equal(a_nocache, a_B), "Audio: cache may be stale")
@@ -773,13 +748,9 @@ class TestLTX2TextContextCache(unittest.TestCase):
             # -- Part 3: CFG slots — slot 0 (cond) != slot 1 (uncond) --
             cache.invalidate()
             torch.manual_seed(200)
-            v_cond, _ = model(
-                *make_mods(0.5, v_ctx_A, a_ctx_A), text_cache=cache, cfg_pass=CfgPass.COND
-            )
+            v_cond, _ = model(*make_mods(0.5, v_ctx_A, a_ctx_A), cfg_pass=CfgPass.COND)
             torch.manual_seed(200)
-            v_uncond, _ = model(
-                *make_mods(0.5, v_ctx_B, a_ctx_B), text_cache=cache, cfg_pass=CfgPass.UNCOND
-            )
+            v_uncond, _ = model(*make_mods(0.5, v_ctx_B, a_ctx_B), cfg_pass=CfgPass.UNCOND)
 
         self.assertFalse(torch.equal(v_cond, v_uncond), "CFG slots must differ")
 
@@ -791,23 +762,15 @@ class TestLTX2TextContextCache(unittest.TestCase):
 
             # Step 1: cond + uncond
             torch.manual_seed(300)
-            v_cond_1, _ = model(
-                *make_mods(0.8, v_ctx_A, a_ctx_A), text_cache=cache, cfg_pass=CfgPass.COND
-            )
+            v_cond_1, _ = model(*make_mods(0.8, v_ctx_A, a_ctx_A), cfg_pass=CfgPass.COND)
             torch.manual_seed(300)
-            v_uncond_1, _ = model(
-                *make_mods(0.8, v_ctx_B, a_ctx_B), text_cache=cache, cfg_pass=CfgPass.UNCOND
-            )
+            v_uncond_1, _ = model(*make_mods(0.8, v_ctx_B, a_ctx_B), cfg_pass=CfgPass.UNCOND)
 
             # Step 2: cond + uncond (should reuse cached KV from step 1)
             torch.manual_seed(400)
-            v_cond_2, _ = model(
-                *make_mods(0.7, v_ctx_A, a_ctx_A), text_cache=cache, cfg_pass=CfgPass.COND
-            )
+            v_cond_2, _ = model(*make_mods(0.7, v_ctx_A, a_ctx_A), cfg_pass=CfgPass.COND)
             torch.manual_seed(400)
-            v_uncond_2, _ = model(
-                *make_mods(0.7, v_ctx_B, a_ctx_B), text_cache=cache, cfg_pass=CfgPass.UNCOND
-            )
+            v_uncond_2, _ = model(*make_mods(0.7, v_ctx_B, a_ctx_B), cfg_pass=CfgPass.UNCOND)
 
         # Cond outputs differ between steps (different latent/timestep).
         self.assertFalse(torch.equal(v_cond_1, v_cond_2), "Steps should differ")
@@ -837,27 +800,23 @@ class TestLTX2TextContextCache(unittest.TestCase):
             # Simulates Stage 1 CFG concat → Stage 2 no-CFG transition.
             cache.invalidate()
             torch.manual_seed(500)
-            v_both, _ = model(*make_mods_b2(0.8), text_cache=cache, cfg_pass=CfgPass.BOTH)
+            v_both, _ = model(*make_mods_b2(0.8), cfg_pass=CfgPass.BOTH)
             self.assertEqual(v_both.shape[0], 2, "BOTH should output batch=2")
 
             # BOTH cache hit
             torch.manual_seed(600)
-            v_both2, _ = model(*make_mods_b2(0.5), text_cache=cache, cfg_pass=CfgPass.BOTH)
+            v_both2, _ = model(*make_mods_b2(0.5), cfg_pass=CfgPass.BOTH)
             self.assertEqual(v_both2.shape[0], 2)
 
             # invalidate → COND (batch=1) — simulates Stage 2
             cache.invalidate()
             torch.manual_seed(700)
-            v_s2, _ = model(
-                *make_mods(0.5, v_ctx_A, a_ctx_A), text_cache=cache, cfg_pass=CfgPass.COND
-            )
+            v_s2, _ = model(*make_mods(0.5, v_ctx_A, a_ctx_A), cfg_pass=CfgPass.COND)
             self.assertEqual(v_s2.shape[0], 1, "Stage 2 COND should be batch=1")
 
             # COND cache hit — must be bitwise identical
             torch.manual_seed(700)
-            v_s2b, _ = model(
-                *make_mods(0.5, v_ctx_A, a_ctx_A), text_cache=cache, cfg_pass=CfgPass.COND
-            )
+            v_s2b, _ = model(*make_mods(0.5, v_ctx_A, a_ctx_A), cfg_pass=CfgPass.COND)
             self.assertTrue(
                 torch.equal(v_s2, v_s2b),
                 f"Stage 2 COND cache hit not identical. Diff: {(v_s2 - v_s2b).abs().max():.6e}",

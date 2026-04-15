@@ -43,7 +43,7 @@ from .ltx2_core.types import (
     VideoPixelShape,
 )
 from .ltx2_core.video_vae import TilingConfig, VideoDecoderConfigurator, VideoEncoderConfigurator
-from .text_context_cache import CfgPass, LTX2TextContextCache, ModalityType
+from .text_context_cache import CfgPass
 from .transformer_ltx2 import LTXModel, LTXModelType
 
 
@@ -565,19 +565,6 @@ class LTX2Pipeline(BasePipeline):
             model_config=self.model_config,
         )
         self.transformer._transformer_config = vars(cfg)
-
-        # Text context cache — caches constant text computations across
-        # denoise steps.  Supports 2 CFG slots (cond + uncond).
-        self._text_cache = LTX2TextContextCache(
-            num_layers=getattr(cfg, "num_layers", 48),
-        )
-        # Inject cache into preprocessors for context/mask/PE caching.
-        self.transformer.video_args_preprocessor.set_text_cache(
-            self._text_cache, ModalityType.VIDEO
-        )
-        self.transformer.audio_args_preprocessor.set_text_cache(
-            self._text_cache, ModalityType.AUDIO
-        )
 
     # ------------------------------------------------------------------
     # CUDA graph setup (Modality-aware override)
@@ -1316,7 +1303,10 @@ class LTX2Pipeline(BasePipeline):
         # Cache text encoder outputs (Gemma3 + Connector) for two-stage
         # Stage 2 reuse.  These are prompt-only dependent — not affected by
         # resolution or LoRA — so they survive invalidate().
-        self._text_cache.store_encoder_output(video_embeds, audio_embeds, connector_mask)
+        # Cache encoder output for two-stage Stage 2 reuse.
+        # Gemma3 + Connector outputs are prompt-only — not affected by
+        # resolution or LoRA — so they survive across stages.
+        self._cached_encoder_output = (video_embeds, audio_embeds, connector_mask)
 
         # ---- 3. Prepare latent shapes -----------------------------------
         logger.info("Preparing latents...")
@@ -1439,7 +1429,7 @@ class LTX2Pipeline(BasePipeline):
 
         # Invalidate text context cache (preprocessor + KV) so the first
         # denoise step refills it.
-        self._text_cache.invalidate()
+        self.transformer._text_cache.invalidate()
 
         # ---- 8. Denoising loop ------------------------------------------
         def _run_transformer(
@@ -1500,7 +1490,6 @@ class LTX2Pipeline(BasePipeline):
                 video=video_mod,
                 audio=audio_mod,
                 perturbations=perturbations,
-                text_cache=self._text_cache,
                 cfg_pass=cfg_pass,
             )
 

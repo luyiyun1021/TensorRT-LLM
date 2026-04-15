@@ -48,12 +48,10 @@ from .ltx2_core.transformer_args import (
     TransformerArgsPreprocessor,
 )
 from .ltx2_core.utils_ltx2 import rms_norm
-from .text_context_cache import CfgPass, ModalityType
+from .text_context_cache import CfgPass, LTX2TextContextCache, ModalityType
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
-
-    from .text_context_cache import LTX2TextContextCache
 
 
 # ---------------------------------------------------------------------------
@@ -815,6 +813,12 @@ class LTXModel(nn.Module):
             apply_gated_attention=apply_gated_attention,
         )
 
+        # Text context cache — always created with the model.
+        self._text_cache = LTX2TextContextCache(num_layers=num_layers)
+        self.video_args_preprocessor.set_text_cache(self._text_cache, ModalityType.VIDEO)
+        if hasattr(self, "audio_args_preprocessor"):
+            self.audio_args_preprocessor.set_text_cache(self._text_cache, ModalityType.AUDIO)
+
         self.__post_init__()
 
     @property
@@ -1191,8 +1195,7 @@ class LTXModel(nn.Module):
         video: Modality | None,
         audio: Modality | None,
         perturbations=None,
-        text_cache: "LTX2TextContextCache" = None,
-        cfg_pass: "CfgPass" = CfgPass.COND,
+        cfg_pass: CfgPass = CfgPass.COND,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Forward pass through the LTX-2 transformer.
 
@@ -1200,8 +1203,6 @@ class LTXModel(nn.Module):
             video: Video modality input (or None).
             audio: Audio modality input (or None).
             perturbations: Optional ``BatchedPerturbationConfig`` for STG.
-            text_cache: Text context cache.  KV projections are filled before
-                the compiled block loop and passed to each block.
             cfg_pass: ``CfgPass.COND`` or ``CfgPass.UNCOND``.  Selects
                 the cache slot for CFG.
 
@@ -1228,17 +1229,18 @@ class LTXModel(nn.Module):
                 audio_args = self._shard_transformer_args(audio_args)
 
         # Fill text KV cache outside torch.compile.
-        if text_cache.kv_is_dirty(cfg_pass):
+        tc = self._text_cache
+        if tc.kv_is_dirty(cfg_pass):
             v_ctx = video_args.context if video_args is not None else None
             a_ctx = audio_args.context if audio_args is not None else None
             for i, block in enumerate(self.transformer_blocks):
                 if v_ctx is not None:
                     k, v = block.attn2.project_kv(v_ctx)
-                    text_cache.store_kv(ModalityType.VIDEO, cfg_pass, i, k, v)
+                    tc.store_kv(ModalityType.VIDEO, cfg_pass, i, k, v)
                 if a_ctx is not None:
                     k, v = block.audio_attn2.project_kv(a_ctx)
-                    text_cache.store_kv(ModalityType.AUDIO, cfg_pass, i, k, v)
-            text_cache.kv_mark_clean(cfg_pass)
+                    tc.store_kv(ModalityType.AUDIO, cfg_pass, i, k, v)
+            tc.kv_mark_clean(cfg_pass)
 
         for i, block in enumerate(self.transformer_blocks):
             video_args, audio_args = block(
@@ -1246,14 +1248,10 @@ class LTXModel(nn.Module):
                 audio=audio_args,
                 perturbations=perturbations,
                 text_kv_video=(
-                    text_cache.get_kv(ModalityType.VIDEO, cfg_pass, i)
-                    if video_args is not None
-                    else None
+                    tc.get_kv(ModalityType.VIDEO, cfg_pass, i) if video_args is not None else None
                 ),
                 text_kv_audio=(
-                    text_cache.get_kv(ModalityType.AUDIO, cfg_pass, i)
-                    if audio_args is not None
-                    else None
+                    tc.get_kv(ModalityType.AUDIO, cfg_pass, i) if audio_args is not None else None
                 ),
             )
 

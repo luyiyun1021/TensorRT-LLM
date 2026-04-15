@@ -69,12 +69,12 @@ class TransformerArgsPreprocessor:
         self.rope_type = rope_type
         self._freq_grid_cache: dict = {}
 
-        # Text context cache — injected via set_text_cache() by pipeline.
+        # Text context cache — set by LTXModel.__init__().
         self._text_cache = None  # LTX2TextContextCache | None
         self._modality = None  # Modality enum | None
 
     def set_text_cache(self, cache, modality) -> None:
-        """Inject shared text context cache.  Called once by pipeline."""
+        """Inject shared text context cache.  Called once by LTXModel.__init__."""
         self._text_cache = cache
         self._modality = modality
 
@@ -144,7 +144,7 @@ class TransformerArgsPreprocessor:
         # Context projection, attention mask, and RoPE are constant across
         # denoise steps — cached per CFG slot and reused.
         cache = self._text_cache
-        cached = cache.get_preproc(cfg_pass, self._modality)
+        cached = cache.get_preproc(cfg_pass, self._modality) if cache is not None else None
         if cached is not None:
             context, attention_mask, pe = cached
         else:
@@ -160,7 +160,8 @@ class TransformerArgsPreprocessor:
                 num_attention_heads=self.num_attention_heads,
                 x_dtype=modality.latent.dtype,
             )
-            cache.store_preproc(cfg_pass, self._modality, context, attention_mask, pe)
+            if cache is not None:
+                cache.store_preproc(cfg_pass, self._modality, context, attention_mask, pe)
 
         return TransformerArgs(
             x=x,

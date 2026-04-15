@@ -697,7 +697,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
 
         # LoRA changed KV projection weights — invalidate text cache so
         # Stage 2 refills with the merged weights.
-        self._text_cache.invalidate()
+        self.transformer._text_cache.invalidate()
 
         # Disable Ulysses for Stage 2: only rank 0 is active, so
         # cross-rank collectives in the attention backend would hang.
@@ -806,7 +806,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         # --- Text conditioning: reuse Stage 1 encoder output from cache ---
         # Gemma3 + Connector outputs depend only on the prompt text, not on
         # resolution or LoRA weights, so we skip the expensive re-encoding.
-        video_embeds, audio_embeds, connector_mask = self._text_cache.get_encoder_output()
+        video_embeds, audio_embeds, connector_mask = self._cached_encoder_output
 
         # --- Shapes at full resolution ---
         pixel_shape = VideoPixelShape(
@@ -942,7 +942,6 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                 vel_v, vel_a = self.transformer(
                     video=video_mod,
                     audio=audio_mod,
-                    text_cache=self._text_cache,
                     cfg_pass=CfgPass.COND,
                 )
 

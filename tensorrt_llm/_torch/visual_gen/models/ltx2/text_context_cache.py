@@ -133,12 +133,6 @@ class LTX2TextContextCache:
             [(_SlicedBuffer(), _SlicedBuffer()) for _ in range(num_layers)] for _ in range(n)
         ]
 
-        # Text encoder output (Gemma3 + Connector): prompt-only dependent,
-        # NOT affected by resolution or LoRA.  Survives invalidate().
-        self._enc_video = _SimpleBuffer()
-        self._enc_audio = _SimpleBuffer()
-        self._enc_mask = _SimpleBuffer()
-
     # -- Lifecycle ---------------------------------------------------------
 
     def invalidate(self) -> None:
@@ -203,28 +197,6 @@ class LTX2TextContextCache:
         if self._cross_pe_dirty[modality]:
             return None
         return (self._cross_pe[modality][0].get(), self._cross_pe[modality][1].get())
-
-    # -- Encoder output (Gemma3 + Connector) --------------------------------
-
-    def store_encoder_output(
-        self,
-        video_embeds: torch.Tensor,
-        audio_embeds: torch.Tensor,
-        connector_mask: torch.Tensor,
-    ) -> None:
-        """Cache text encoder output for cross-stage reuse."""
-        self._enc_video.store(video_embeds)
-        self._enc_audio.store(audio_embeds)
-        self._enc_mask.store(connector_mask)
-
-    def get_encoder_output(
-        self,
-    ) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-        """Return cached (video_embeds, audio_embeds, connector_mask) or None."""
-        v = self._enc_video.get()
-        if v is None:
-            return None
-        return (v, self._enc_audio.get(), self._enc_mask.get())
 
     # -- KV ----------------------------------------------------------------
 
