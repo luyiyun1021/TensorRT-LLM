@@ -573,6 +573,7 @@ class TestLTX2CUDAGraphCapture(unittest.TestCase):
             .eval()
         )
         _init_all_weights(model)
+        cache = _inject_text_cache(model, AUDIO_VIDEO_CONFIG["num_layers"])
 
         batch = 1
         v_frames, v_h, v_w = 1, 4, 4
@@ -611,8 +612,9 @@ class TestLTX2CUDAGraphCapture(unittest.TestCase):
         # 1. Eager forward — baseline
         torch.manual_seed(100)
         video_mod, audio_mod = _make_modalities(0.5)
+        cache.invalidate()
         with torch.no_grad():
-            eager_v, eager_a = model(video=video_mod, audio=audio_mod)
+            eager_v, eager_a = model(video=video_mod, audio=audio_mod, text_cache=cache)
         eager_v = eager_v.clone()
         eager_a = eager_a.clone()
 
@@ -624,8 +626,9 @@ class TestLTX2CUDAGraphCapture(unittest.TestCase):
         # 3. First call — triggers capture (same inputs as eager)
         torch.manual_seed(100)
         video_mod, audio_mod = _make_modalities(0.5)
+        cache.invalidate()
         with torch.no_grad():
-            graph_v1, graph_a1 = model(video=video_mod, audio=audio_mod)
+            graph_v1, graph_a1 = model(video=video_mod, audio=audio_mod, text_cache=cache)
 
         self.assertTrue(
             torch.equal(eager_v, graph_v1),
@@ -642,8 +645,9 @@ class TestLTX2CUDAGraphCapture(unittest.TestCase):
 
         # Eager baseline for new inputs
         model.forward = original_forward
+        cache.invalidate()
         with torch.no_grad():
-            eager_v2, eager_a2 = model(video=video_mod2, audio=audio_mod2)
+            eager_v2, eager_a2 = model(video=video_mod2, audio=audio_mod2, text_cache=cache)
         eager_v2 = eager_v2.clone()
         eager_a2 = eager_a2.clone()
 
@@ -651,8 +655,9 @@ class TestLTX2CUDAGraphCapture(unittest.TestCase):
         model.forward = runner.wrap(original_forward)
         torch.manual_seed(200)
         video_mod2, audio_mod2 = _make_modalities(0.3)
+        cache.invalidate()
         with torch.no_grad():
-            graph_v2, graph_a2 = model(video=video_mod2, audio=audio_mod2)
+            graph_v2, graph_a2 = model(video=video_mod2, audio=audio_mod2, text_cache=cache)
 
         self.assertTrue(
             torch.equal(eager_v2, graph_v2),

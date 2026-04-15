@@ -803,16 +803,10 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         logger.info("Stage 2: refinement denoising...")
         generator = torch.Generator(device=self.device).manual_seed(seed)
 
-        # --- Text conditioning (positive only, no CFG) ---
-        prompt_embeds, prompt_attention_mask = self._encode_prompt(
-            prompt,
-            num_videos_per_prompt=1,
-            max_sequence_length=max_sequence_length,
-        )
-        video_embeds, audio_embeds, connector_mask = self._process_connectors(
-            prompt_embeds,
-            prompt_attention_mask,
-        )
+        # --- Text conditioning: reuse Stage 1 encoder output from cache ---
+        # Gemma3 + Connector outputs depend only on the prompt text, not on
+        # resolution or LoRA weights, so we skip the expensive re-encoding.
+        video_embeds, audio_embeds, connector_mask = self._text_cache.get_encoder_output()
 
         # --- Shapes at full resolution ---
         pixel_shape = VideoPixelShape(

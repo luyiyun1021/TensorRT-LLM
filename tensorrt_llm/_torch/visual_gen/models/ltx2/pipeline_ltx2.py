@@ -1313,6 +1313,11 @@ class LTX2Pipeline(BasePipeline):
             neg_audio_embeds = None
             neg_connector_mask = None
 
+        # Cache text encoder outputs (Gemma3 + Connector) for two-stage
+        # Stage 2 reuse.  These are prompt-only dependent — not affected by
+        # resolution or LoRA — so they survive invalidate().
+        self._text_cache.store_encoder_output(video_embeds, audio_embeds, connector_mask)
+
         # ---- 3. Prepare latent shapes -----------------------------------
         logger.info("Preparing latents...")
         pixel_shape = VideoPixelShape(

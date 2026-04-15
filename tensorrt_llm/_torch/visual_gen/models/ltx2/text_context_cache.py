@@ -10,6 +10,8 @@ Two storage strategies:
 * ``_SimpleBuffer``: plain store/return without batch manipulation.
   Used for position-only tensors identical across CFG passes (PE, cross-PE).
 
+Dirty state is managed externally by ``LTX2TextContextCache``, not by buffers.
+
 CFG modes (for ``_SlicedBuffer``):
     COND   → buf[1:2]   (index 1)
     UNCOND → buf[0:1]   (index 0)
@@ -100,7 +102,10 @@ class _SimpleBuffer:
 
 
 class LTX2TextContextCache:
-    """Text context cache with mixed buffer strategies.
+    """Text context cache with external dirty management.
+
+    Dirty flags live here, not in buffers.  ``invalidate()`` marks groups
+    dirty; ``store_*`` clears them; ``get_*`` checks before returning.
 
     Args:
         num_layers: Number of transformer blocks.
@@ -118,24 +123,33 @@ class LTX2TextContextCache:
         self._pe = [(_SimpleBuffer(), _SimpleBuffer()) for _ in range(n)]
         self._cross_pe = [(_SimpleBuffer(), _SimpleBuffer()) for _ in range(n)]
 
-        # [modality][cfg_pass] → dirty
+        # Dirty flags
         self._preproc_dirty: list[list[bool]] = [[True, True] for _ in range(n)]
+        self._cross_pe_dirty: list[bool] = [True] * n
+        self._kv_dirty: list[bool] = [True, True]  # [cfg_pass]
 
         # KV buffers: CFG-dependent → _SlicedBuffer
         self._kv = [
             [(_SlicedBuffer(), _SlicedBuffer()) for _ in range(num_layers)] for _ in range(n)
         ]
-        self._kv_dirty: list[bool] = [True, True]  # [cfg_pass]
+
+        # Text encoder output (Gemma3 + Connector): prompt-only dependent,
+        # NOT affected by resolution or LoRA.  Survives invalidate().
+        self._enc_video = _SimpleBuffer()
+        self._enc_audio = _SimpleBuffer()
+        self._enc_mask = _SimpleBuffer()
 
     # -- Lifecycle ---------------------------------------------------------
 
     def invalidate(self) -> None:
-        """Mark all dirty.  Clear cross-PE (resolution may change across stages)."""
+        """Mark preproc, cross-PE, and KV dirty for refill.
+
+        Encoder output is NOT invalidated — it depends only on prompt text,
+        not on resolution or LoRA weights.
+        """
         for m in range(len(ModalityType)):
             self._preproc_dirty[m] = [True, True]
-            # cross_pe has no dirty flag — clear buffers so stale data from a
-            # previous stage/resolution is not returned by get_cross_pe().
-            self._cross_pe[m] = (_SimpleBuffer(), _SimpleBuffer())
+            self._cross_pe_dirty[m] = True
         self._kv_dirty = [True, True]
 
     # -- Preprocessor ------------------------------------------------------
@@ -151,7 +165,6 @@ class LTX2TextContextCache:
         self._ctx[modality].store(cfg_pass, context)
         if mask is not None:
             self._mask[modality].store(cfg_pass, mask)
-        # PE is position-only — simple store, no CFG slicing.
         self._pe[modality][0].store(pe[0])
         self._pe[modality][1].store(pe[1])
         if cfg_pass == CfgPass.BOTH:
@@ -179,20 +192,39 @@ class LTX2TextContextCache:
 
     def store_cross_pe(
         self,
-        cfg_pass: CfgPass,
         modality: ModalityType,
         cross_pe: tuple[torch.Tensor, torch.Tensor],
     ) -> None:
         self._cross_pe[modality][0].store(cross_pe[0])
         self._cross_pe[modality][1].store(cross_pe[1])
+        self._cross_pe_dirty[modality] = False
 
-    def get_cross_pe(
-        self, cfg_pass: CfgPass, modality: ModalityType
-    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
-        c = self._cross_pe[modality][0].get()
-        if c is None:
+    def get_cross_pe(self, modality: ModalityType) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        if self._cross_pe_dirty[modality]:
             return None
-        return (c, self._cross_pe[modality][1].get())
+        return (self._cross_pe[modality][0].get(), self._cross_pe[modality][1].get())
+
+    # -- Encoder output (Gemma3 + Connector) --------------------------------
+
+    def store_encoder_output(
+        self,
+        video_embeds: torch.Tensor,
+        audio_embeds: torch.Tensor,
+        connector_mask: torch.Tensor,
+    ) -> None:
+        """Cache text encoder output for cross-stage reuse."""
+        self._enc_video.store(video_embeds)
+        self._enc_audio.store(audio_embeds)
+        self._enc_mask.store(connector_mask)
+
+    def get_encoder_output(
+        self,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Return cached (video_embeds, audio_embeds, connector_mask) or None."""
+        v = self._enc_video.get()
+        if v is None:
+            return None
+        return (v, self._enc_audio.get(), self._enc_mask.get())
 
     # -- KV ----------------------------------------------------------------
 
@@ -221,5 +253,7 @@ class LTX2TextContextCache:
     def get_kv(
         self, modality: ModalityType, cfg_pass: CfgPass, layer_idx: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        kb, vb = self._kv[modality][layer_idx]
-        return kb.get(cfg_pass), vb.get(cfg_pass)
+        return (
+            self._kv[modality][layer_idx][0].get(cfg_pass),
+            self._kv[modality][layer_idx][1].get(cfg_pass),
+        )

@@ -225,9 +225,9 @@ class MultiModalTransformerArgsPreprocessor:
         sp = self.simple_preprocessor
         transformer_args = sp.prepare(modality, cfg_pass)
 
-        # Cross-PE: constant across steps, cached on the raw entry.
+        # Cross-PE: position-only, constant across steps and CFG passes.
         cache = sp._text_cache
-        cross_pe = cache.get_cross_pe(cfg_pass, sp._modality)
+        cross_pe = cache.get_cross_pe(sp._modality)
         if cross_pe is None:
             cross_pe = sp._prepare_positional_embeddings(
                 positions=modality.positions[:, 0:1, :],
@@ -237,7 +237,7 @@ class MultiModalTransformerArgsPreprocessor:
                 num_attention_heads=sp.num_attention_heads,
                 x_dtype=modality.latent.dtype,
             )
-            cache.store_cross_pe(cfg_pass, sp._modality, cross_pe)
+            cache.store_cross_pe(sp._modality, cross_pe)
 
         cross_scale_shift_timestep, cross_gate_timestep = self._prepare_cross_attention_timestep(
             timestep=modality.timesteps,
