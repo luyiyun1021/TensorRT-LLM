@@ -48,7 +48,7 @@ from .ltx2_core.transformer_args import (
     TransformerArgsPreprocessor,
 )
 from .ltx2_core.utils_ltx2 import rms_norm
-from .text_context_cache import CfgPass, LTX2TextContextCache, ModalityType
+from .static_preproc import StaticPreproc
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
@@ -490,8 +490,7 @@ class BasicAVTransformerBlock(nn.Module):
         Args:
             perturbations: Optional ``BatchedPerturbationConfig`` that masks
                 attention outputs for selected blocks/modalities.
-            text_kv_video: Pre-projected (K, V) for video text cross-attention,
-                computed by ``LTX2TextContextCache`` outside the compiled region.
+            text_kv_video: Pre-projected (K, V) for video text cross-attention.
                 Falls back to inline computation if ``None``.
             text_kv_audio: Pre-projected (K, V) for audio text cross-attention.
         """
@@ -531,6 +530,7 @@ class BasicAVTransformerBlock(nn.Module):
                 vx = vx + v_self_out
             vx = vx + self.attn2(
                 rms_norm(vx, eps=self.norm_eps),
+                context=video.context if text_kv_video is None else None,
                 pre_projected_kv=text_kv_video,
             )
             del vshift_msa, vscale_msa, vgate_msa
@@ -555,6 +555,7 @@ class BasicAVTransformerBlock(nn.Module):
                 ax = ax + a_self_out
             ax = ax + self.audio_attn2(
                 rms_norm(ax, eps=self.norm_eps),
+                context=audio.context if text_kv_audio is None else None,
                 pre_projected_kv=text_kv_audio,
             )
             del ashift_msa, ascale_msa, agate_msa
@@ -812,12 +813,6 @@ class LTXModel(nn.Module):
             norm_eps=norm_eps,
             apply_gated_attention=apply_gated_attention,
         )
-
-        # Text context cache — always created with the model.
-        self._text_cache = LTX2TextContextCache(num_layers=num_layers)
-        self.video_args_preprocessor.set_text_cache(self._text_cache, ModalityType.VIDEO)
-        if hasattr(self, "audio_args_preprocessor"):
-            self.audio_args_preprocessor.set_text_cache(self._text_cache, ModalityType.AUDIO)
 
         self.__post_init__()
 
@@ -1190,12 +1185,89 @@ class LTXModel(nn.Module):
 
     # -- Forward -------------------------------------------------------------
 
+    def prepare_static(
+        self,
+        *,
+        video_context: torch.Tensor | None = None,
+        video_context_mask: torch.Tensor | None = None,
+        video_positions: torch.Tensor | None = None,
+        audio_context: torch.Tensor | None = None,
+        audio_context_mask: torch.Tensor | None = None,
+        audio_positions: torch.Tensor | None = None,
+        dtype: torch.dtype,
+    ) -> StaticPreproc:
+        """Compute step-invariant preprocessor outputs and text KV projections.
+
+        Called once before the denoise loop.  The returned ``StaticPreproc``
+        is passed to ``forward()`` on every step.  Does not require latent
+        data — only text context, positions, and dtype are needed.
+        """
+        sp = StaticPreproc.__new__(StaticPreproc)
+
+        if video_context is not None:
+            prep = self.video_args_preprocessor
+            if hasattr(prep, "simple_preprocessor"):
+                ctx, mask, pe, cross_pe = prep.prepare_static(
+                    video_context, video_context_mask, video_positions, dtype
+                )
+                sp.video_cross_pe = cross_pe
+            else:
+                ctx, mask, pe = prep.prepare_static(
+                    video_context, video_context_mask, video_positions, dtype
+                )
+                sp.video_cross_pe = None
+            sp.video_context = ctx
+            sp.video_mask = mask
+            sp.video_pe = pe
+        else:
+            sp.video_context = None
+            sp.video_mask = None
+            sp.video_pe = None
+            sp.video_cross_pe = None
+
+        if audio_context is not None:
+            prep = self.audio_args_preprocessor
+            if hasattr(prep, "simple_preprocessor"):
+                ctx, mask, pe, cross_pe = prep.prepare_static(
+                    audio_context, audio_context_mask, audio_positions, dtype
+                )
+                sp.audio_cross_pe = cross_pe
+            else:
+                ctx, mask, pe = prep.prepare_static(
+                    audio_context, audio_context_mask, audio_positions, dtype
+                )
+                sp.audio_cross_pe = None
+            sp.audio_context = ctx
+            sp.audio_mask = mask
+            sp.audio_pe = pe
+        else:
+            sp.audio_context = None
+            sp.audio_mask = None
+            sp.audio_pe = None
+            sp.audio_cross_pe = None
+
+        # Per-layer text KV projections
+        sp.video_kv = []
+        sp.audio_kv = []
+        for block in self.transformer_blocks:
+            if sp.video_context is not None:
+                sp.video_kv.append(block.attn2.project_kv(sp.video_context))
+            if sp.audio_context is not None and hasattr(block, "audio_attn2"):
+                sp.audio_kv.append(block.audio_attn2.project_kv(sp.audio_context))
+
+        if not sp.video_kv:
+            sp.video_kv = None
+        if not sp.audio_kv:
+            sp.audio_kv = None
+
+        return sp
+
     def forward(
         self,
         video: Modality | None,
         audio: Modality | None,
         perturbations=None,
-        cfg_pass: CfgPass = CfgPass.COND,
+        static: StaticPreproc | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Forward pass through the LTX-2 transformer.
 
@@ -1203,8 +1275,9 @@ class LTXModel(nn.Module):
             video: Video modality input (or None).
             audio: Audio modality input (or None).
             perturbations: Optional ``BatchedPerturbationConfig`` for STG.
-            cfg_pass: ``CfgPass.COND`` or ``CfgPass.UNCOND``.  Selects
-                the cache slot for CFG.
+            static: Pre-computed step-invariant outputs from ``prepare_static()``.
+                When provided, skips context projection, PE computation, and
+                text KV projection (only step-variant ops run inside the graph).
 
         Returns:
             Tuple of (video_output, audio_output) velocity predictions.
@@ -1214,12 +1287,35 @@ class LTXModel(nn.Module):
         if not self.model_type.is_audio_enabled() and audio is not None:
             raise ValueError("Audio is not enabled for this model")
 
-        video_args = (
-            self.video_args_preprocessor.prepare(video, cfg_pass) if video is not None else None
-        )
-        audio_args = (
-            self.audio_args_preprocessor.prepare(audio, cfg_pass) if audio is not None else None
-        )
+        if static is not None and video is not None:
+            video_args = self.video_args_preprocessor.prepare(
+                video,
+                static_context=static.video_context,
+                static_mask=static.video_mask,
+                static_pe=static.video_pe,
+                **(
+                    {"static_cross_pe": static.video_cross_pe}
+                    if hasattr(self.video_args_preprocessor, "simple_preprocessor")
+                    else {}
+                ),
+            )
+        else:
+            video_args = self.video_args_preprocessor.prepare(video) if video is not None else None
+
+        if static is not None and audio is not None:
+            audio_args = self.audio_args_preprocessor.prepare(
+                audio,
+                static_context=static.audio_context,
+                static_mask=static.audio_mask,
+                static_pe=static.audio_pe,
+                **(
+                    {"static_cross_pe": static.audio_cross_pe}
+                    if hasattr(self.audio_args_preprocessor, "simple_preprocessor")
+                    else {}
+                ),
+            )
+        else:
+            audio_args = self.audio_args_preprocessor.prepare(audio) if audio is not None else None
 
         # Shard sequences for Ulysses parallelism.
         if self.use_ulysses:
@@ -1228,30 +1324,16 @@ class LTXModel(nn.Module):
             if self._audio_is_sharded and audio_args is not None:
                 audio_args = self._shard_transformer_args(audio_args)
 
-        # Fill text KV cache outside torch.compile.
-        tc = self._text_cache
-        if tc.kv_is_dirty(cfg_pass):
-            v_ctx = video_args.context if video_args is not None else None
-            a_ctx = audio_args.context if audio_args is not None else None
-            for i, block in enumerate(self.transformer_blocks):
-                if v_ctx is not None:
-                    k, v = block.attn2.project_kv(v_ctx)
-                    tc.store_kv(ModalityType.VIDEO, cfg_pass, i, k, v)
-                if a_ctx is not None:
-                    k, v = block.audio_attn2.project_kv(a_ctx)
-                    tc.store_kv(ModalityType.AUDIO, cfg_pass, i, k, v)
-            tc.kv_mark_clean(cfg_pass)
-
         for i, block in enumerate(self.transformer_blocks):
             video_args, audio_args = block(
                 video=video_args,
                 audio=audio_args,
                 perturbations=perturbations,
                 text_kv_video=(
-                    tc.get_kv(ModalityType.VIDEO, cfg_pass, i) if video_args is not None else None
+                    static.video_kv[i] if static is not None and static.video_kv else None
                 ),
                 text_kv_audio=(
-                    tc.get_kv(ModalityType.AUDIO, cfg_pass, i) if audio_args is not None else None
+                    static.audio_kv[i] if static is not None and static.audio_kv else None
                 ),
             )
 

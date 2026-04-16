@@ -43,7 +43,6 @@ from .ltx2_core.types import (
     VideoPixelShape,
 )
 from .ltx2_core.video_vae import TilingConfig, VideoDecoderConfigurator, VideoEncoderConfigurator
-from .text_context_cache import CfgPass
 from .transformer_ltx2 import LTXModel, LTXModelType
 
 
@@ -1300,14 +1299,6 @@ class LTX2Pipeline(BasePipeline):
             neg_audio_embeds = None
             neg_connector_mask = None
 
-        # Cache text encoder outputs (Gemma3 + Connector) for two-stage
-        # Stage 2 reuse.  These are prompt-only dependent — not affected by
-        # resolution or LoRA — so they survive invalidate().
-        # Cache encoder output for two-stage Stage 2 reuse.
-        # Gemma3 + Connector outputs are prompt-only — not affected by
-        # resolution or LoRA — so they survive across stages.
-        self._cached_encoder_output = (video_embeds, audio_embeds, connector_mask)
-
         # ---- 3. Prepare latent shapes -----------------------------------
         logger.info("Preparing latents...")
         pixel_shape = VideoPixelShape(
@@ -1427,11 +1418,57 @@ class LTX2Pipeline(BasePipeline):
         if do_stg and stg_blocks:
             stg_perturbation = build_stg_perturbation_config(stg_blocks)
 
-        # Invalidate text context cache (preprocessor + KV) so the first
-        # denoise step refills it.
-        self.transformer._text_cache.invalidate()
+        # ---- 8. Pre-compute step-invariant text projections ---------------
+        # When BasePipeline handles CFG on a single GPU (not CFG-parallel),
+        # it concatenates [neg, cond] into batch=2.  The static preproc
+        # must match this batching so KV projections align with the latent
+        # batch dimension.  With cfg_size>=2 (CFG parallel), BasePipeline
+        # splits across ranks — each rank gets batch=1, so no batching.
+        do_basepipeline_cfg_parallel = cfg_size >= 2 and do_cfg
+        batched_cfg = not use_multi_modal_guidance and do_cfg and not do_basepipeline_cfg_parallel
+        if batched_cfg and neg_video_embeds is not None:
+            static_v_ctx = torch.cat([neg_video_embeds, video_embeds])
+            static_v_mask = (
+                torch.cat([neg_connector_mask, connector_mask])
+                if connector_mask is not None
+                else None
+            )
+            static_a_ctx = (
+                torch.cat([neg_audio_embeds, audio_embeds])
+                if audio_latents is not None and neg_audio_embeds is not None
+                else (audio_embeds if audio_latents is not None else None)
+            )
+            static_a_mask = (
+                torch.cat([neg_connector_mask, connector_mask])
+                if audio_latents is not None and connector_mask is not None
+                else None
+            )
+        elif do_basepipeline_cfg_parallel and cfg_rank != 0 and neg_video_embeds is not None:
+            # CFG parallel rank 1 (unconditional): use negative embeddings
+            static_v_ctx = neg_video_embeds
+            static_v_mask = neg_connector_mask
+            static_a_ctx = neg_audio_embeds if audio_latents is not None else None
+            static_a_mask = neg_connector_mask if audio_latents is not None else None
+        else:
+            static_v_ctx = video_embeds
+            static_v_mask = connector_mask
+            static_a_ctx = audio_embeds if audio_latents is not None else None
+            static_a_mask = connector_mask if audio_latents is not None else None
 
-        # ---- 8. Denoising loop ------------------------------------------
+        _static = self.transformer.prepare_static(
+            video_context=static_v_ctx,
+            video_context_mask=static_v_mask,
+            video_positions=video_positions,
+            audio_context=static_a_ctx,
+            audio_context_mask=static_a_mask,
+            audio_positions=audio_positions if audio_latents is not None else None,
+            dtype=self.dtype,
+        )
+
+        # Cache encoder output for two-stage Stage 2 reuse.
+        self._cached_encoder_output = (video_embeds, audio_embeds, connector_mask)
+
+        # ---- 9. Denoising loop ------------------------------------------
         def _run_transformer(
             v_latents,
             a_latents,
@@ -1440,7 +1477,7 @@ class LTX2Pipeline(BasePipeline):
             a_context,
             mask,
             perturbations=None,
-            cfg_pass=CfgPass.COND,
+            static=None,
         ):
             """Single transformer pass → (denoised_video, denoised_audio).
 
@@ -1490,7 +1527,7 @@ class LTX2Pipeline(BasePipeline):
                 video=video_mod,
                 audio=audio_mod,
                 perturbations=perturbations,
-                cfg_pass=cfg_pass,
+                static=static,
             )
 
             dn_v = None
@@ -1527,10 +1564,6 @@ class LTX2Pipeline(BasePipeline):
             step_counter[0] += 1
 
             if not use_multi_modal_guidance or video_guider.should_skip_step(cur_step):
-                # BasePipeline concatenates [uncond, cond] into batch=2
-                # when guidance_scale > 1.  Use BOTH so the cache splits
-                # into per-slot storage correctly.
-                bp_cfg = CfgPass.BOTH if video_latents.shape[0] > 1 else CfgPass.COND
                 dn_v, dn_a = _run_transformer(
                     video_latents,
                     audio_latents_in,
@@ -1538,7 +1571,7 @@ class LTX2Pipeline(BasePipeline):
                     encoder_hidden_states,
                     extra_tensors.get("audio_embeds", audio_embeds),
                     extra_tensors.get("attention_mask", connector_mask),
-                    cfg_pass=bp_cfg,
+                    static=_static,
                 )
                 return dn_v, {"audio": dn_a}
 
@@ -1554,8 +1587,10 @@ class LTX2Pipeline(BasePipeline):
                         video_embeds,
                         audio_embeds,
                         connector_mask,
+                        static=_static,
                     )
                 else:
+                    # UNCOND pass uses different context → no static preproc
                     local_v, local_a = _run_transformer(
                         video_latents,
                         audio_latents_in,
@@ -1563,7 +1598,6 @@ class LTX2Pipeline(BasePipeline):
                         neg_video_embeds,
                         neg_audio_embeds,
                         neg_connector_mask,
-                        cfg_pass=CfgPass.UNCOND,
                     )
 
                 local_v = local_v.contiguous()
@@ -1589,6 +1623,7 @@ class LTX2Pipeline(BasePipeline):
                     video_embeds,
                     audio_embeds,
                     connector_mask,
+                    static=_static,
                 )
                 uncond_v = 0.0
                 uncond_a = 0.0
@@ -1600,7 +1635,6 @@ class LTX2Pipeline(BasePipeline):
                         neg_video_embeds,
                         neg_audio_embeds,
                         neg_connector_mask,
-                        cfg_pass=CfgPass.UNCOND,
                     )
 
             # STG: perturbed attention pass

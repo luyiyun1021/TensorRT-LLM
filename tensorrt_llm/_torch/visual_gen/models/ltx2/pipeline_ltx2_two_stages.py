@@ -35,7 +35,6 @@ from .ltx2_core.types import (
 from .ltx2_core.upsampler import LatentUpsamplerConfigurator, upsample_video
 from .ltx2_core.video_vae import TilingConfig
 from .pipeline_ltx2 import LTX2Pipeline, _assert_resolution, _find_safetensors_files
-from .text_context_cache import CfgPass
 
 STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
 
@@ -695,10 +694,6 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         )
         logger.info(f"Merged distilled LoRA ({n} params) for stage 2")
 
-        # LoRA changed KV projection weights — invalidate text cache so
-        # Stage 2 refills with the merged weights.
-        self.transformer._text_cache.invalidate()
-
         # Disable Ulysses for Stage 2: only rank 0 is active, so
         # cross-rank collectives in the attention backend would hang.
         self.transformer.set_ulysses_enabled(False)
@@ -803,9 +798,9 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         logger.info("Stage 2: refinement denoising...")
         generator = torch.Generator(device=self.device).manual_seed(seed)
 
-        # --- Text conditioning: reuse Stage 1 encoder output from cache ---
-        # Gemma3 + Connector outputs depend only on the prompt text, not on
-        # resolution or LoRA weights, so we skip the expensive re-encoding.
+        # --- Text conditioning: reuse Stage 1 encoder output ---
+        # Gemma3 + Connector outputs depend only on prompt text, not on
+        # resolution or LoRA weights.
         video_embeds, audio_embeds, connector_mask = self._cached_encoder_output
 
         # --- Shapes at full resolution ---
@@ -908,6 +903,17 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             a_noise = torch.randn_like(a_working, generator=generator)
             a_working = a_noise * sigma_0 + a_working * (1.0 - sigma_0)
 
+        # --- Pre-compute static preproc (context, PE, KV) for Stage 2 ---
+        _s2_static = self.transformer.prepare_static(
+            video_context=video_embeds,
+            video_context_mask=connector_mask,
+            video_positions=video_positions,
+            audio_context=audio_embeds if a_working is not None else None,
+            audio_context_mask=connector_mask if a_working is not None else None,
+            audio_positions=audio_positions if a_working is not None else None,
+            dtype=self.dtype,
+        )
+
         # --- Euler denoising loop (no guidance) ---
         for i in range(len(sigmas) - 1):
             with nvtx_range(f"refinement_step {i}"):
@@ -942,7 +948,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                 vel_v, vel_a = self.transformer(
                     video=video_mod,
                     audio=audio_mod,
-                    cfg_pass=CfgPass.COND,
+                    static=_s2_static,
                 )
 
                 # Video: velocity → x0 → post-process → Euler step
