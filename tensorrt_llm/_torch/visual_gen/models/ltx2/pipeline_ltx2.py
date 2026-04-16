@@ -202,12 +202,16 @@ class _LTX2CUDAGraphRunner(CUDAGraphRunner):
     """CUDAGraphRunner extended for LTX-2's ``Modality``-based transformer.
 
     The base runner derives graph keys from flat ``torch.Tensor`` args.
-    LTX-2's transformer takes ``Modality`` dataclasses (bundles of tensors)
-    and optional ``BatchedPerturbationConfig`` objects that affect control flow.
+    LTX-2's transformer takes ``Modality`` dataclasses (bundles of tensors),
+    optional ``BatchedPerturbationConfig``, and a ``TextCache`` kwarg.
 
     This subclass overrides key derivation, capture, and replay so that
     ``Modality`` tensors are included in the graph key, cloned into static
     buffers at capture time, and copied in-place at replay time.
+
+    ``TextCache`` is step-invariant (constant across the denoise loop),
+    so it is excluded from the graph key and passed through without
+    cloning or copying.
     """
 
     @staticmethod
@@ -227,7 +231,12 @@ class _LTX2CUDAGraphRunner(CUDAGraphRunner):
 
     def _key_parts_for(self, prefix, v):
         """Yield ``(label, shape_or_tag)`` pairs for a single argument."""
-        if isinstance(v, torch.Tensor):
+        from .text_cache import TextCache
+
+        if isinstance(v, TextCache):
+            # TextCache is step-invariant — excluded from graph key.
+            return
+        elif isinstance(v, torch.Tensor):
             yield (prefix, tuple(v.shape))
         elif isinstance(v, Modality):
             yield (f"{prefix}.latent", tuple(v.latent.shape))
@@ -254,6 +263,10 @@ class _LTX2CUDAGraphRunner(CUDAGraphRunner):
 
     @staticmethod
     def _clone_value(v):
+        from .text_cache import TextCache
+
+        if isinstance(v, TextCache):
+            return v  # Step-invariant — share reference, no clone needed.
         if isinstance(v, torch.Tensor):
             return v.clone()
         if isinstance(v, Modality):
@@ -271,6 +284,10 @@ class _LTX2CUDAGraphRunner(CUDAGraphRunner):
     @staticmethod
     def _copy_value(dst, src):
         """Copy data from *src* into *dst* static buffer in-place."""
+        from .text_cache import TextCache
+
+        if isinstance(src, TextCache):
+            return src  # Step-invariant — no copy needed.
         if isinstance(src, torch.Tensor) and isinstance(dst, torch.Tensor):
             dst.copy_(src)
             return dst
@@ -1418,51 +1435,60 @@ class LTX2Pipeline(BasePipeline):
         if do_stg and stg_blocks:
             stg_perturbation = build_stg_perturbation_config(stg_blocks)
 
-        # ---- 8. Pre-compute step-invariant text projections ---------------
-        # When BasePipeline handles CFG on a single GPU (not CFG-parallel),
-        # it concatenates [neg, cond] into batch=2.  The static preproc
-        # must match this batching so KV projections align with the latent
-        # batch dimension.  With cfg_size>=2 (CFG parallel), BasePipeline
-        # splits across ranks — each rank gets batch=1, so no batching.
-        do_basepipeline_cfg_parallel = cfg_size >= 2 and do_cfg
-        batched_cfg = not use_multi_modal_guidance and do_cfg and not do_basepipeline_cfg_parallel
-        if batched_cfg and neg_video_embeds is not None:
-            static_v_ctx = torch.cat([neg_video_embeds, video_embeds])
-            static_v_mask = (
+        # ---- 8. Pre-compute text cache(s) for the denoise loop ---------------
+        # Determine which text context this rank needs:
+        #   batched CFG (1 GPU, no multi-modal guidance): cat([neg, cond]) batch=2
+        #   CFG parallel rank 1: neg context only
+        #   everything else: cond context only
+        has_audio = audio_latents is not None
+        batched_cfg = do_cfg and cfg_size < 2 and not use_multi_modal_guidance
+        is_uncond_rank = cfg_size >= 2 and cfg_rank != 0 and do_cfg
+
+        if batched_cfg:
+            v_ctx = torch.cat([neg_video_embeds, video_embeds])
+            v_mask = (
                 torch.cat([neg_connector_mask, connector_mask])
                 if connector_mask is not None
                 else None
             )
-            static_a_ctx = (
-                torch.cat([neg_audio_embeds, audio_embeds])
-                if audio_latents is not None and neg_audio_embeds is not None
-                else (audio_embeds if audio_latents is not None else None)
-            )
-            static_a_mask = (
+            a_ctx = torch.cat([neg_audio_embeds, audio_embeds]) if has_audio else None
+            a_mask = (
                 torch.cat([neg_connector_mask, connector_mask])
-                if audio_latents is not None and connector_mask is not None
+                if has_audio and connector_mask is not None
                 else None
             )
-        elif do_basepipeline_cfg_parallel and cfg_rank != 0 and neg_video_embeds is not None:
-            # CFG parallel rank 1 (unconditional): use negative embeddings
-            static_v_ctx = neg_video_embeds
-            static_v_mask = neg_connector_mask
-            static_a_ctx = neg_audio_embeds if audio_latents is not None else None
-            static_a_mask = neg_connector_mask if audio_latents is not None else None
+        elif is_uncond_rank:
+            v_ctx, v_mask = neg_video_embeds, neg_connector_mask
+            a_ctx = neg_audio_embeds if has_audio else None
+            a_mask = neg_connector_mask if has_audio else None
         else:
-            static_v_ctx = video_embeds
-            static_v_mask = connector_mask
-            static_a_ctx = audio_embeds if audio_latents is not None else None
-            static_a_mask = connector_mask if audio_latents is not None else None
+            v_ctx, v_mask = video_embeds, connector_mask
+            a_ctx = audio_embeds if has_audio else None
+            a_mask = connector_mask if has_audio else None
 
-        _static = self.transformer.prepare_static(
-            video_context=static_v_ctx,
-            video_context_mask=static_v_mask,
+        _text_cache = self.transformer.prepare_text_cache(
+            video_context=v_ctx,
+            video_context_mask=v_mask,
             video_positions=video_positions,
-            audio_context=static_a_ctx,
-            audio_context_mask=static_a_mask,
-            audio_positions=audio_positions if audio_latents is not None else None,
+            audio_context=a_ctx,
+            audio_context_mask=a_mask,
+            audio_positions=audio_positions if has_audio else None,
             dtype=self.dtype,
+        )
+
+        # Uncond cache — only when multi-modal guidance runs separate uncond passes.
+        _text_cache_uncond = (
+            self.transformer.prepare_text_cache(
+                video_context=neg_video_embeds,
+                video_context_mask=neg_connector_mask,
+                video_positions=video_positions,
+                audio_context=neg_audio_embeds if has_audio else None,
+                audio_context_mask=neg_connector_mask if has_audio else None,
+                audio_positions=audio_positions if has_audio else None,
+                dtype=self.dtype,
+            )
+            if use_multi_modal_guidance and do_cfg
+            else None
         )
 
         # Cache encoder output for two-stage Stage 2 reuse.
@@ -1477,7 +1503,8 @@ class LTX2Pipeline(BasePipeline):
             a_context,
             mask,
             perturbations=None,
-            static=None,
+            *,
+            text_cache,
         ):
             """Single transformer pass → (denoised_video, denoised_audio).
 
@@ -1527,7 +1554,7 @@ class LTX2Pipeline(BasePipeline):
                 video=video_mod,
                 audio=audio_mod,
                 perturbations=perturbations,
-                static=static,
+                text_cache=text_cache,
             )
 
             dn_v = None
@@ -1571,7 +1598,7 @@ class LTX2Pipeline(BasePipeline):
                     encoder_hidden_states,
                     extra_tensors.get("audio_embeds", audio_embeds),
                     extra_tensors.get("attention_mask", connector_mask),
-                    static=_static,
+                    text_cache=_text_cache,
                 )
                 return dn_v, {"audio": dn_a}
 
@@ -1587,10 +1614,9 @@ class LTX2Pipeline(BasePipeline):
                         video_embeds,
                         audio_embeds,
                         connector_mask,
-                        static=_static,
+                        text_cache=_text_cache,
                     )
                 else:
-                    # UNCOND pass uses different context → no static preproc
                     local_v, local_a = _run_transformer(
                         video_latents,
                         audio_latents_in,
@@ -1598,6 +1624,7 @@ class LTX2Pipeline(BasePipeline):
                         neg_video_embeds,
                         neg_audio_embeds,
                         neg_connector_mask,
+                        text_cache=_text_cache_uncond,
                     )
 
                 local_v = local_v.contiguous()
@@ -1623,7 +1650,7 @@ class LTX2Pipeline(BasePipeline):
                     video_embeds,
                     audio_embeds,
                     connector_mask,
-                    static=_static,
+                    text_cache=_text_cache,
                 )
                 uncond_v = 0.0
                 uncond_a = 0.0
@@ -1635,6 +1662,7 @@ class LTX2Pipeline(BasePipeline):
                         neg_video_embeds,
                         neg_audio_embeds,
                         neg_connector_mask,
+                        text_cache=_text_cache_uncond,
                     )
 
             # STG: perturbed attention pass
@@ -1652,6 +1680,7 @@ class LTX2Pipeline(BasePipeline):
                     audio_embeds,
                     connector_mask,
                     perturbations=batched,
+                    text_cache=_text_cache,
                 )
 
             # Modality guidance: disable cross-modal attention
@@ -1665,6 +1694,7 @@ class LTX2Pipeline(BasePipeline):
                     video_embeds,
                     None,
                     connector_mask,
+                    text_cache=_text_cache,
                 )
                 if audio_latents_in is not None:
                     _, iso_a = _run_transformer(
@@ -1674,6 +1704,7 @@ class LTX2Pipeline(BasePipeline):
                         None,
                         audio_embeds,
                         connector_mask,
+                        text_cache=_text_cache,
                     )
 
             guided_v = video_guider.calculate(cond_v, uncond_v, perturbed_v, iso_v)

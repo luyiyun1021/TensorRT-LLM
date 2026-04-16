@@ -904,7 +904,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             a_working = a_noise * sigma_0 + a_working * (1.0 - sigma_0)
 
         # --- Pre-compute static preproc (context, PE, KV) for Stage 2 ---
-        _s2_static = self.transformer.prepare_static(
+        _s2_static = self.transformer.prepare_text_cache(
             video_context=video_embeds,
             video_context_mask=connector_mask,
             video_positions=video_positions,
@@ -948,7 +948,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                 vel_v, vel_a = self.transformer(
                     video=video_mod,
                     audio=audio_mod,
-                    static=_s2_static,
+                    text_cache=_s2_static,
                 )
 
                 # Video: velocity → x0 → post-process → Euler step

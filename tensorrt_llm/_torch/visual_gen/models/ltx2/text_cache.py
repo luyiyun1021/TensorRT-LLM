@@ -17,7 +17,7 @@ import torch
 
 
 @dataclass
-class StaticPreproc:
+class TextCache:
     """Pre-computed text-derived tensors that are constant across denoise steps.
 
     Attributes:
@@ -33,13 +33,13 @@ class StaticPreproc:
         audio_kv: Per-layer pre-projected text K/V for audio cross-attention.
     """
 
-    video_context: torch.Tensor
-    video_mask: Optional[torch.Tensor]
-    video_pe: tuple[torch.Tensor, torch.Tensor]
+    video_context: Optional[torch.Tensor] = None
+    video_mask: Optional[torch.Tensor] = None
+    video_pe: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+    video_cross_pe: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+    video_kv: Optional[list[tuple[torch.Tensor, torch.Tensor]]] = None
     audio_context: Optional[torch.Tensor] = None
     audio_mask: Optional[torch.Tensor] = None
     audio_pe: Optional[tuple[torch.Tensor, torch.Tensor]] = None
-    video_cross_pe: Optional[tuple[torch.Tensor, torch.Tensor]] = None
     audio_cross_pe: Optional[tuple[torch.Tensor, torch.Tensor]] = None
-    video_kv: Optional[list[tuple[torch.Tensor, torch.Tensor]]] = None
     audio_kv: Optional[list[tuple[torch.Tensor, torch.Tensor]]] = None

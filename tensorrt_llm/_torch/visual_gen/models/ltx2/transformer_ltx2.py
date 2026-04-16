@@ -48,7 +48,7 @@ from .ltx2_core.transformer_args import (
     TransformerArgsPreprocessor,
 )
 from .ltx2_core.utils_ltx2 import rms_norm
-from .static_preproc import StaticPreproc
+from .text_cache import TextCache
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
@@ -530,7 +530,7 @@ class BasicAVTransformerBlock(nn.Module):
                 vx = vx + v_self_out
             vx = vx + self.attn2(
                 rms_norm(vx, eps=self.norm_eps),
-                context=video.context if text_kv_video is None else None,
+                context=video.context,
                 pre_projected_kv=text_kv_video,
             )
             del vshift_msa, vscale_msa, vgate_msa
@@ -555,7 +555,7 @@ class BasicAVTransformerBlock(nn.Module):
                 ax = ax + a_self_out
             ax = ax + self.audio_attn2(
                 rms_norm(ax, eps=self.norm_eps),
-                context=audio.context if text_kv_audio is None else None,
+                context=audio.context,
                 pre_projected_kv=text_kv_audio,
             )
             del ashift_msa, ascale_msa, agate_msa
@@ -1185,7 +1185,7 @@ class LTXModel(nn.Module):
 
     # -- Forward -------------------------------------------------------------
 
-    def prepare_static(
+    def prepare_text_cache(
         self,
         *,
         video_context: torch.Tensor | None = None,
@@ -1195,79 +1195,48 @@ class LTXModel(nn.Module):
         audio_context_mask: torch.Tensor | None = None,
         audio_positions: torch.Tensor | None = None,
         dtype: torch.dtype,
-    ) -> StaticPreproc:
+    ) -> TextCache:
         """Compute step-invariant preprocessor outputs and text KV projections.
 
-        Called once before the denoise loop.  The returned ``StaticPreproc``
+        Called once before the denoise loop.  The returned ``TextCache``
         is passed to ``forward()`` on every step.  Does not require latent
         data — only text context, positions, and dtype are needed.
         """
-        sp = StaticPreproc.__new__(StaticPreproc)
+        v_ctx = v_mask = v_pe = v_cross_pe = v_kv = None
+        a_ctx = a_mask = a_pe = a_cross_pe = a_kv = None
 
         if video_context is not None:
-            prep = self.video_args_preprocessor
-            if hasattr(prep, "simple_preprocessor"):
-                ctx, mask, pe, cross_pe = prep.prepare_static(
-                    video_context, video_context_mask, video_positions, dtype
-                )
-                sp.video_cross_pe = cross_pe
-            else:
-                ctx, mask, pe = prep.prepare_static(
-                    video_context, video_context_mask, video_positions, dtype
-                )
-                sp.video_cross_pe = None
-            sp.video_context = ctx
-            sp.video_mask = mask
-            sp.video_pe = pe
-        else:
-            sp.video_context = None
-            sp.video_mask = None
-            sp.video_pe = None
-            sp.video_cross_pe = None
+            v_ctx, v_mask, v_pe, v_cross_pe = self.video_args_preprocessor.prepare_text_cache(
+                video_context, video_context_mask, video_positions, dtype
+            )
+            v_kv = [block.attn2.project_kv(v_ctx) for block in self.transformer_blocks]
 
         if audio_context is not None:
-            prep = self.audio_args_preprocessor
-            if hasattr(prep, "simple_preprocessor"):
-                ctx, mask, pe, cross_pe = prep.prepare_static(
-                    audio_context, audio_context_mask, audio_positions, dtype
-                )
-                sp.audio_cross_pe = cross_pe
-            else:
-                ctx, mask, pe = prep.prepare_static(
-                    audio_context, audio_context_mask, audio_positions, dtype
-                )
-                sp.audio_cross_pe = None
-            sp.audio_context = ctx
-            sp.audio_mask = mask
-            sp.audio_pe = pe
-        else:
-            sp.audio_context = None
-            sp.audio_mask = None
-            sp.audio_pe = None
-            sp.audio_cross_pe = None
+            a_ctx, a_mask, a_pe, a_cross_pe = self.audio_args_preprocessor.prepare_text_cache(
+                audio_context, audio_context_mask, audio_positions, dtype
+            )
+            a_kv = [block.audio_attn2.project_kv(a_ctx) for block in self.transformer_blocks]
 
-        # Per-layer text KV projections
-        sp.video_kv = []
-        sp.audio_kv = []
-        for block in self.transformer_blocks:
-            if sp.video_context is not None:
-                sp.video_kv.append(block.attn2.project_kv(sp.video_context))
-            if sp.audio_context is not None and hasattr(block, "audio_attn2"):
-                sp.audio_kv.append(block.audio_attn2.project_kv(sp.audio_context))
-
-        if not sp.video_kv:
-            sp.video_kv = None
-        if not sp.audio_kv:
-            sp.audio_kv = None
-
-        return sp
+        return TextCache(
+            video_context=v_ctx,
+            video_mask=v_mask,
+            video_pe=v_pe,
+            video_cross_pe=v_cross_pe,
+            video_kv=v_kv,
+            audio_context=a_ctx,
+            audio_mask=a_mask,
+            audio_pe=a_pe,
+            audio_cross_pe=a_cross_pe,
+            audio_kv=a_kv,
+        )
 
     def forward(
         self,
         video: Modality | None,
         audio: Modality | None,
         perturbations=None,
-        static: StaticPreproc | None = None,
+        *,
+        text_cache: TextCache,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Forward pass through the LTX-2 transformer.
 
@@ -1275,9 +1244,8 @@ class LTXModel(nn.Module):
             video: Video modality input (or None).
             audio: Audio modality input (or None).
             perturbations: Optional ``BatchedPerturbationConfig`` for STG.
-            static: Pre-computed step-invariant outputs from ``prepare_static()``.
-                When provided, skips context projection, PE computation, and
-                text KV projection (only step-variant ops run inside the graph).
+            text_cache: Pre-computed step-invariant outputs from ``prepare_text_cache()``.
+                Always required — callers must invoke ``prepare_text_cache()`` first.
 
         Returns:
             Tuple of (video_output, audio_output) velocity predictions.
@@ -1287,35 +1255,28 @@ class LTXModel(nn.Module):
         if not self.model_type.is_audio_enabled() and audio is not None:
             raise ValueError("Audio is not enabled for this model")
 
-        if static is not None and video is not None:
-            video_args = self.video_args_preprocessor.prepare(
+        video_args = (
+            self.video_args_preprocessor.prepare(
                 video,
-                static_context=static.video_context,
-                static_mask=static.video_mask,
-                static_pe=static.video_pe,
-                **(
-                    {"static_cross_pe": static.video_cross_pe}
-                    if hasattr(self.video_args_preprocessor, "simple_preprocessor")
-                    else {}
-                ),
+                text_cache.video_context,
+                text_cache.video_mask,
+                text_cache.video_pe,
+                text_cache.video_cross_pe,
             )
-        else:
-            video_args = self.video_args_preprocessor.prepare(video) if video is not None else None
-
-        if static is not None and audio is not None:
-            audio_args = self.audio_args_preprocessor.prepare(
+            if video is not None
+            else None
+        )
+        audio_args = (
+            self.audio_args_preprocessor.prepare(
                 audio,
-                static_context=static.audio_context,
-                static_mask=static.audio_mask,
-                static_pe=static.audio_pe,
-                **(
-                    {"static_cross_pe": static.audio_cross_pe}
-                    if hasattr(self.audio_args_preprocessor, "simple_preprocessor")
-                    else {}
-                ),
+                text_cache.audio_context,
+                text_cache.audio_mask,
+                text_cache.audio_pe,
+                text_cache.audio_cross_pe,
             )
-        else:
-            audio_args = self.audio_args_preprocessor.prepare(audio) if audio is not None else None
+            if audio is not None
+            else None
+        )
 
         # Shard sequences for Ulysses parallelism.
         if self.use_ulysses:
@@ -1324,17 +1285,16 @@ class LTXModel(nn.Module):
             if self._audio_is_sharded and audio_args is not None:
                 audio_args = self._shard_transformer_args(audio_args)
 
+        v_kv = text_cache.video_kv
+        a_kv = text_cache.audio_kv
+
         for i, block in enumerate(self.transformer_blocks):
             video_args, audio_args = block(
                 video=video_args,
                 audio=audio_args,
                 perturbations=perturbations,
-                text_kv_video=(
-                    static.video_kv[i] if static is not None and static.video_kv else None
-                ),
-                text_kv_audio=(
-                    static.audio_kv[i] if static is not None and static.audio_kv else None
-                ),
+                text_kv_video=v_kv[i] if v_kv else None,
+                text_kv_audio=a_kv[i] if a_kv else None,
             )
 
         # Gather sequences back to full length for output processing.
