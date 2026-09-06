@@ -10,9 +10,8 @@ python -m tensorrt_llm.serve.scripts.benchmark_visual_gen \
 ```
 
 A run has two kinds of input: **the workload**, which is what to generate, and **the run
-settings**, which are how to send it and where to put the results. Only the first decides what
-the numbers mean, which is why it lives in a document you can diff. This page is split the
-same way: [Input](#input), then [Output](#output).
+settings**, which are how to send it and where to put the results. This page is split the same
+way: [Input](#input), then [Output](#output).
 
 `--help` lists every flag.
 
@@ -48,7 +47,7 @@ requests:
 | `backend` | top level | Selects the route, and so what the run measures. Required here or as `--backend`; disagreeing with it is an error. |
 | `prompt` | request or `common_params` | The prompt text. |
 | `prompt_file` | request or `common_params` | Path to a prompt file. Mutually exclusive with `prompt`. |
-| `image_reference` | request only | Reference image; it conditions one generation, so `common_params` rejects it. `openai-videos` (I2V) and `openai-image-edits`, which requires it. |
+| `image_reference` | request only | Reference image; it conditions one generation, so `common_params` rejects it. Taken by `openai-videos` (I2V) and by `openai-image-edits`, which requires it. |
 | `video_reference` · `audio_reference` | request only | Reference video and audio, `openai-videos` only. |
 | `extra_params` | request or `common_params` | Per-pipeline parameters. Shallow-merged, so a request overriding one key keeps the others. |
 | everything else | request or `common_params` | The `VisualGenParams` fields the route accepts: `width`, `height`, `num_inference_steps`, `guidance_scale`, `seed`, `max_sequence_length`, `negative_prompt` on all three, plus `num_frames` and `frame_rate` on `openai-videos`, `num_images_per_prompt` on the image routes. Naming one the route does not take is an error. |

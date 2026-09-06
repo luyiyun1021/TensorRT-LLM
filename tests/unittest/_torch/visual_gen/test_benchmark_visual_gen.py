@@ -270,7 +270,7 @@ def test_missing_reference_fails_before_the_run(tmp_path):
     ids=["object-with-prompt", "plain-text"],
 )
 def test_prompt_file_shapes(tmp_path, contents, expected):
-    """The shapes Cosmos3 prompt files come in (cosmos3.py:110-133)."""
+    """The shapes Cosmos3 prompt files come in."""
     path = tmp_path / "p.json"
     path.write_text(contents)
 

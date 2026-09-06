@@ -449,8 +449,7 @@ class VisualGenPerfSanityTestConfig:
             model_path,
             "--backend",
             str(client_config["backend"]),
-            # Keep the media on the wire, so e2e_latency stays comparable to the
-            # baselines: the client's own default returns a path instead.
+            # Keep the media on the wire, so e2e_latency covers the transfer.
             "--response-format",
             "file" if str(client_config["backend"]) == "openai-videos" else "b64_json",
             "--host",

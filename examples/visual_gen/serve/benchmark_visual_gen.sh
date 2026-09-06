@@ -132,7 +132,6 @@ wait_for_server
 echo ""
 echo "Step 2: Running benchmark..."
 
-# Generation config now travels in a workload document, not on the command line.
 WORKLOAD_FILE="${RESULT_DIR}/workload.yaml"
 mkdir -p "${RESULT_DIR}"
 {
@@ -148,8 +147,7 @@ mkdir -p "${RESULT_DIR}"
     echo "  frame_rate: ${FPS}"
   fi
   echo "requests:"
-  # YAML single-quoted: only ' needs escaping, by doubling, so a prompt carrying
-  # quotes or backslashes stays the prompt the run measured.
+  # YAML single-quoted: ' is the only character needing an escape, by doubling.
   for _ in $(seq 1 "${NUM_PROMPTS}"); do
     echo "  - prompt: '${PROMPT//\'/\'\'}'"
   done

@@ -661,8 +661,7 @@ def build_payload(
     params = _params_dump(request)
 
     if backend == VIDEO_BACKEND:
-        # Typed fields -- the deprecated ``input_reference`` sniffs the
-        # content to guess the modality instead.
+        # Typed fields, so the modality is named rather than sniffed.
         for slot in REFERENCE_KEYS:
             if getattr(request, slot) is not None:
                 payload[slot] = getattr(request, slot)
@@ -1250,8 +1249,7 @@ def print_visual_gen_results(result: dict[str, Any], selected_percentiles: list[
         if (block := result.get(name)) is not None
     ]
     # Measured from what this run prints: --metric-percentiles decides the column
-    # count, and a request long enough to reach --request-timeout outgrows a fixed
-    # column width.
+    # count, and a latency has no bound to size a column against.
     widths = [max(len(cell) for cell in column) + 2 for column in zip(header, *rows)]
     width = sum(widths)
 

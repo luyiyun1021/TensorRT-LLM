@@ -213,6 +213,6 @@ def build_visual_gen_db_entry(
         "s_test_case_name": f"{server_name}-{client_name}",
     }
     entry.update(extract_visual_gen_metrics(result_data))
-    # The client no longer knows the topology, so per-GPU throughput is derived here.
+    # The client does not know the topology, so per-GPU throughput is derived here.
     entry["d_per_gpu_throughput"] = entry["d_request_throughput"] / expected_num_gpus
     return entry
