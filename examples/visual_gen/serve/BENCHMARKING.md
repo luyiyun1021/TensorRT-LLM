@@ -204,7 +204,7 @@ the encode finishes within one `--poll-interval`.
 | `params` | The merged parameters as sent, which is what a run actually measured. |
 | `success` · `error` | Outcome. A run with any failure is not a result. |
 | `start` · `end` | Wall-clock bounds. |
-| `client_e2e` · `client_gen` · `server_e2e` · `server_gen` · `server_denoise` | The five timings; `null` where undefined for the backend or not reported. |
+| `client_e2e` · `client_gen` · `server_e2e` · `server_gen` · `server_pre_denoise` · `server_denoise` · `server_post_denoise` | The seven timings; `null` where undefined for the backend or not reported. |
 | `poll_count` | Status polls, video only. |
 | `output_paths` | Always a list; an image request with `n > 1` has several. Server-side paths under `--response-format path`, and local files under `--output-media-dir`. |
 

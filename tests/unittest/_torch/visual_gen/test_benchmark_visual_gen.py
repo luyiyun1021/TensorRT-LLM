@@ -186,7 +186,7 @@ def reference_file(tmp_path):
 
 @pytest.mark.parametrize("slot", REFERENCE_KEYS)
 def test_local_path_is_encoded_before_the_run(slot, reference_file):
-    """A bare path is the recipe ergonomics; VisualGenParams rejects one itself."""
+    """A bare path is the document's ergonomics; VisualGenParams rejects one itself."""
     request = _workload(**{slot: str(reference_file)}).requests[0]
 
     assert getattr(request, slot) == {
@@ -287,7 +287,7 @@ def test_structured_caption_is_serialized(tmp_path):
 
 
 def test_prompt_file_records_where_the_prompt_came_from(tmp_path):
-    """The recipe cites a file, so the record has to name it, not just its text."""
+    """The document cites a file, so the record has to name it, not just its text."""
     path = tmp_path / "p.txt"
     path.write_text("from a file")
     workload = _workload(prompt_file=str(path))
