@@ -28,9 +28,8 @@ like any other backend.
   ``attention_mask``, other dtypes or devices, shorter sequences, and every call of a layer whose
   head dimension or K/V head count the kernels do not take.
 * Padding: ``key_padding_mask`` (``[B, S]``, True for a token) is read as one valid prefix per
-  sample, its count of tokens, on the kernels and on VANILLA alike
-  (``requires_trailing_padding``): the model puts the tokens of every sample first. Padded rows
-  get no attention weight and come back zero.
+  sample, its count of tokens, on the kernels and on VANILLA alike: the model puts the tokens of
+  every sample first. Padded rows get no attention weight and come back zero.
 * One sequence: a call whose q, k and v have one shape, on the kernels and on VANILLA alike. Its
   padded rows are excluded as keys and come back zero as queries. The Attention module builds
   its cross-attention layers on VANILLA, so such a call is self-attention; a direct caller
@@ -307,11 +306,3 @@ class DeCoAttention(AttentionBackend):
     @classmethod
     def support_fused_qkv(cls) -> bool:
         return False
-
-    @classmethod
-    def support_key_padding_mask(cls) -> bool:
-        return True
-
-    @classmethod
-    def requires_trailing_padding(cls) -> bool:
-        return True

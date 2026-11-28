@@ -20,7 +20,7 @@ Uses diffusion-specific wrappers (TrtllmAttention, VanillaAttention)
 that handle metadata preparation internally for simplified usage.
 """
 
-from typing import NamedTuple, Optional, Type
+from typing import Optional, Type
 
 import torch
 
@@ -140,58 +140,6 @@ def get_visual_gen_attention_backend(
         from .vanilla import VanillaAttention
 
         return VanillaAttention
-
-
-class PaddingSupport(NamedTuple):
-    """What the dense attention backend of a config takes for the padding of a sequence.
-
-    Attributes:
-        supports_mask: The backend takes ``key_padding_mask``.
-        supports_length: The backend takes ``valid_seq_len``.
-        requires_trailing: The padding must follow the tokens; also true for a backend that
-            takes only the length.
-    """
-
-    supports_mask: bool
-    supports_length: bool
-    requires_trailing: bool
-
-    @property
-    def supports_padding(self) -> bool:
-        """Whether the backend can attend a padded sequence at all."""
-        return self.supports_mask or self.supports_length
-
-
-def get_padding_support(attention_config: AttentionConfig) -> PaddingSupport:
-    """
-    Get what the dense attention backend of a config takes for the padding of a sequence.
-
-    A model hands a backend that takes a mask the mask, and one that takes only the length the
-    length; a backend that takes neither cannot attend a padded sequence.
-
-    Args:
-        attention_config: AttentionConfig that selects the backend and its quantization recipe.
-
-    Returns:
-        PaddingSupport of the backend class under that recipe
-    """
-    # A config object without the field carries no quantization recipe.
-    quant_attention_config = getattr(attention_config, "quant_attention_config", None)
-    backend_cls = get_visual_gen_attention_backend(
-        attention_config.backend, quant_algorithm=get_quant_algorithm(quant_attention_config)
-    )
-    supports_mask = backend_cls.support_key_padding_mask()
-    supports_length = backend_cls.support_valid_seq_len()
-    # The quantized recipes of these backends run on kernels without padding: FLASHINFER rejects
-    # a mask and TRTLLM the valid prefix.
-    if quant_attention_config is not None:
-        backend = attention_config.backend.upper()
-        supports_mask = supports_mask and backend != "FLASHINFER"
-        supports_length = supports_length and backend != "TRTLLM"
-    requires_trailing = backend_cls.requires_trailing_padding() or (
-        supports_length and not supports_mask
-    )
-    return PaddingSupport(supports_mask, supports_length, requires_trailing)
 
 
 def create_attention(

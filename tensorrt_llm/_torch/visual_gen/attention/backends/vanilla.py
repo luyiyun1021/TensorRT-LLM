@@ -131,7 +131,3 @@ class VanillaAttention(AttentionBackend):
     @classmethod
     def support_fused_qkv(cls) -> bool:
         return False
-
-    @classmethod
-    def support_key_padding_mask(cls) -> bool:
-        return True
